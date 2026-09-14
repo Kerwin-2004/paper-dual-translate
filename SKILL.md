@@ -10,7 +10,6 @@ description: >-
   当用户要求「双栏对照翻译」「左英右中」「文献翻译成 PDF」「把这篇论文翻译成中文」、
   「双语对照 PDF」「LR_dual」「翻译论文并保留排版」「建文献库/术语库」时使用。
 license: MIT
-version: 1.5.1
 ---
 
 # 双栏对照文献翻译（左英文原文 / 右中文对照）
@@ -34,12 +33,11 @@ version: 1.5.1
 
 ### 模式 A：Agent 直译（两阶段工作流）
 
-1. **第一阶段：一键预处理抽取（v4 列感知自然段模型）**
+1. **第一阶段：一键预处理抽取**
    ```bash
    python scripts/pipeline.py --source "paper.pdf" --mode prepare --work-dir work
    ```
-   > 自动完成：旋转页归一化、**表格优先抽取（题注与表体硬隔离）**、**v4.1 列感知自然段抽取**（自动区分 left/right/full 列、拆分混栏原始块、识别跨栏图片/矢量图/表格 barrier、显式 `flow_index` 阅读序）、bbox 嵌套簇审计。生成 `work/blocks.json`、`work/tables.json` 与 `work/manifest.json` 来源签名。
-   > **强烈推荐**：翻译前可运行 `python scripts/debug_flow.py --source paper.pdf --blocks work/blocks.json --pages 1-3 --out work/flow-overlay.pdf` 先行核对真实阅读序。
+   该命令会归一化旋转页，隔离表格题注与表体，按列和自然段抽取正文，识别跨栏布局障碍，并生成带来源签名的中间文件。翻译前可用 `debug_flow.py` 核对阅读序。
 
 2. **第二阶段：Agent 翻译生成 JSON**
    - 读 `work/blocks.json`，按下方 [Agent 翻译契约](#agent-翻译硬约束与输出契约) 生成 `work/translations.json`（可按页拆分为 `trans_p1_2.json` 等多文件）；
@@ -91,7 +89,7 @@ python scripts/pipeline.py --source "paper.pdf" --mode auto --output "output/pap
   - **表格所在的文本块（`kind="table"`）**（表格走独立通道，避免整块替换破坏矢量网格）。
 - **`blank: true`（清空）**：仅抹除原文，不写入新字（用于跨行碎片并入主块后的残留清理）。
 
-**v4 列感知与流序关键字段（`blocks.json`）**：
+列感知与流序关键字段（`blocks.json`）：
 - **`flow_index`**：自然阅读顺序编号。翻译与构建均严格按此顺序串流，保证先读完左栏再读右栏（全宽大图表/标题前后重新分区）。
 - **`kind`**：语义类别（`body` / `heading` / `table` / `table_caption` / `figure_caption` / `math_only` / `meta`）。
 - **`column`**：分栏属性（`left` / `right` / `full`）。

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """paper-dual-translate / extract_blocks.py
 
-v4.1 column-aware paragraph extractor:
+Column-aware paragraph extractor:
 raw PDF blocks -> table isolation -> left/right/full classification
 -> column-local paragraph merge -> explicit flow_index.
 """
@@ -488,7 +488,7 @@ def main(argv=None) -> int:
 
     result = {
         "schema_version": 4,
-        "extractor": "column-aware-paragraph-v4.1-layout-barriers",
+        "extractor": "column-aware-paragraph-layout-barriers",
         "source": str(src),
         "page_count": doc.page_count,
         "pages": [],
@@ -559,7 +559,7 @@ def main(argv=None) -> int:
 
     total = sum(len(p["blocks"]) for p in result["pages"])
     body = sum(1 for p in result["pages"] for b in p["blocks"] if b["kind"] == "body")
-    print(f"v4.1 抽取完成: {len(result['pages'])} 页 / {total} 块 / 正文自然段 {body}")
+    print(f"抽取完成: {len(result['pages'])} 页 / {total} 块 / 正文自然段 {body}")
     for p in result["pages"]:
         kinds = {}
         for b in p["blocks"]:

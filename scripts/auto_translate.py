@@ -332,7 +332,7 @@ def call_api(cfg, messages, timeout, temperature, retries=0):
     }
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "paper-dual-translate/1.5.1",
+        "User-Agent": "paper-dual-translate",
     }
     if cfg.get("key"):
         headers["Authorization"] = f"Bearer {cfg['key']}"
