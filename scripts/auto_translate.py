@@ -62,6 +62,7 @@ try:
     import config as PDT
 except Exception:
     PDT = None
+import provenance as PROV
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_FILE = SKILL_ROOT / "references" / "translate_prompt.txt"
@@ -483,17 +484,23 @@ def make_batches(items, budget):
     return batches
 
 
-def make_flow_batches(items, budget, flow_pos):
-    """Batch only adjacent source-flow items; resume gaps start a new batch."""
+def make_flow_batches(items, budget, flow_pos, flow_breaks=()):
+    """Batch only adjacent global-flow items and never cross structural breaks."""
     batches, run = [], []
     previous = None
+    previous_id = None
+    flow_breaks = set(flow_breaks)
     for item in items:
         position = flow_pos[item[0]]
-        if run and previous is not None and position != previous + 1:
+        if (run and previous is not None
+                and (position != previous + 1
+                     or item[0] in flow_breaks
+                     or previous_id in flow_breaks)):
             batches.extend(make_batches(run, budget))
             run = []
         run.append(item)
         previous = position
+        previous_id = item[0]
     if run:
         batches.extend(make_batches(run, budget))
     return batches
@@ -673,8 +680,8 @@ def main(argv=None) -> int:
     data = json.loads(Path(args.blocks).read_text(encoding="utf-8"))
     pages = data.get("pages", [])
     block_identities = {
-        b["id"]: {"source_hash": b.get("source_hash"), "layout_uid": b.get("layout_uid")}
-        for p in pages for b in p.get("blocks", [])
+        block["id"]: PROV.block_identity(int(page.get("page", 0)), block)
+        for page in pages for block in page.get("blocks", [])
     }
     total_pages = data.get("page_count") or (max((p.get("page", 0) for p in pages), default=0))
     want = parse_pages(args.pages, total_pages)
@@ -722,6 +729,7 @@ def main(argv=None) -> int:
     }
 
     items, flow_items, item_meta, skipped = [], [], {}, {}
+    flow_breaks, translatable_ids = set(), set()
     for p in pages:
         pno = p.get("page")
         if want and pno not in want:
@@ -730,15 +738,20 @@ def main(argv=None) -> int:
         for b in sorted(p.get("blocks", []), key=lambda x: x.get("flow_index", 10**9)):
             b["_page"] = pno
             b["text"] = re.sub(r"\s*\n\s*", " ", b.get("text", "")).strip()
+            flow_items.append((b["id"], b["text"]))
+            if (b.get("flow_break") or b.get("kind") in {
+                    "heading", "table", "table_caption", "figure_caption", "math_only"}):
+                flow_breaks.add(b["id"])
             if args.no_skip:
                 sk, why = False, ""
             else:
                 sk, why = should_skip(b, pno, rect, ctx)
             if sk:
                 skipped[b["id"]] = why
+                flow_breaks.add(b["id"])
                 ctx["counts"][why] = ctx["counts"].get(why, 0) + 1
                 continue
-            flow_items.append((b["id"], b["text"]))
+            translatable_ids.add(b["id"])
             flags = {}
             if b.get("continues_from_prev"):
                 flags["continues_from_prev"] = True
@@ -756,7 +769,7 @@ def main(argv=None) -> int:
 
     flow_pos = {bid: idx for idx, (bid, _) in enumerate(flow_items)}
     n_chars = sum(len(t) for _, t in items)
-    batches = make_flow_batches(items, args.batch_chars, flow_pos)
+    batches = make_flow_batches(items, args.batch_chars, flow_pos, flow_breaks)
     print(f"待译 {len(items)} 块 / {n_chars} 字符 -> {len(batches)} 批"
           f"（每批 ≤{args.batch_chars} 字符，并发 {args.workers}）")
     if skipped:
@@ -803,9 +816,14 @@ def main(argv=None) -> int:
         first = flow_pos[batch[0][0]]
         last = flow_pos[batch[-1][0]]
         nearby = []
-        if first > 0:
+        if (first > 0 and flow_items[first - 1][0] in translatable_ids
+                and batch[0][0] not in flow_breaks
+                and flow_items[first - 1][0] not in flow_breaks):
             nearby.append("前文: " + flow_items[first - 1][1])
-        if last + 1 < len(flow_items):
+        if (last + 1 < len(flow_items)
+                and flow_items[last + 1][0] in translatable_ids
+                and batch[-1][0] not in flow_breaks
+                and flow_items[last + 1][0] not in flow_breaks):
             nearby.append("后文: " + flow_items[last + 1][1])
         return tuple(nearby)
 

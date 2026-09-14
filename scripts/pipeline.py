@@ -29,6 +29,7 @@ merge_paragraphs、auto_translate、build_dual、verify_render 与 qc_check。
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -294,6 +295,13 @@ def main(argv=None) -> int:
                       "段落断句合并 (merge_paragraphs)")
         if rc != 0:
             return rc
+
+        # Identity must describe the final block state after every bbox/text mutation.
+        blocks_data = json.loads(blocks_json.read_text(encoding="utf-8"))
+        refreshed = PROV.refresh_block_identities(blocks_data)
+        blocks_json.write_text(
+            json.dumps(blocks_data, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"块身份已按最终版面刷新: {refreshed} 个变更")
 
         # 所有预处理步骤成功后才更新来源清单并解除失败保护。
         manifest = PROV.write_manifest(manifest_json, src_path, effective_source, args.pages)

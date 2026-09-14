@@ -119,13 +119,12 @@ class PdfLayoutIntegrationTests(unittest.TestCase):
             page = doc.new_page(width=600, height=800)
             page.insert_textbox(
                 fitz.Rect(40, 90, 560, 145),
-                "Table 1. Applications of\nLLM4RL.", fontsize=10)
-            for y in (180, 220, 260):
+                "Table 1. Applications of\nLLM4RL.\nMethod                         Score",
+                fontsize=10)
+            for y in (120, 160, 200):
                 page.draw_line((40, y), (560, y), width=0.8)
-            page.insert_textbox(fitz.Rect(50, 184, 250, 215), "Method", fontsize=9)
-            page.insert_textbox(fitz.Rect(350, 184, 540, 215), "Score", fontsize=9)
-            page.insert_textbox(fitz.Rect(50, 224, 250, 255), "Baseline", fontsize=9)
-            page.insert_textbox(fitz.Rect(350, 224, 540, 255), "0.9", fontsize=9)
+            page.insert_textbox(fitz.Rect(50, 164, 250, 195), "Baseline", fontsize=9)
+            page.insert_textbox(fitz.Rect(350, 164, 540, 195), "0.9", fontsize=9)
             doc.save(source)
             doc.close()
 
@@ -136,7 +135,8 @@ class PdfLayoutIntegrationTests(unittest.TestCase):
             cell_text = " ".join(cell["text"] for cell in table["cells"])
             self.assertNotIn("Applications", cell_text)
             self.assertNotIn("LLM4RL", cell_text)
-            self.assertGreaterEqual(table["region"][1], 179)
+            self.assertIn("Method", cell_text)
+            self.assertGreaterEqual(table["region"][1], 119)
 
             self.assertEqual(extract_blocks.main([
                 "--input", str(source), "--output", str(blocks_path),
@@ -145,6 +145,7 @@ class PdfLayoutIntegrationTests(unittest.TestCase):
             captions = [block for block in blocks if block["kind"] == "table_caption"]
             self.assertEqual(len(captions), 1)
             self.assertIn("Applications of LLM4RL", captions[0]["text"])
+            self.assertNotIn("Method", captions[0]["text"])
 
 
 if __name__ == "__main__":

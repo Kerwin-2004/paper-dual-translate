@@ -94,7 +94,8 @@ python scripts/pipeline.py --source "paper.pdf" --mode auto --output "output/pap
 - **`kind`**：语义类别（`body` / `heading` / `table` / `table_caption` / `figure_caption` / `math_only` / `meta`）。
 - **`column`**：分栏属性（`left` / `right` / `full`）。
 - **`continues_to_next` / `continues_from_prev`**：检测到跨页连续句子时标记；自动翻译会把标记传给模型，构建器也会据此禁止续段误缩进。
-- **`layout_uid`**：页码、列、量化 bbox 与源文本共同生成的版面身份；必须与 `source_hash` 一起复制。
+- **`flow_break`**：标题、题注、表格、公式或跨栏对象形成的语义边界；自动翻译不得跨边界组批。
+- **`layout_uid`**：全部预处理完成后，由页码、列、最终 bbox 与源文本生成；构建时会现场重算，必须与 `source_hash` 一起复制。
 
 ### 2. 数学公式与符号排版规范
 - PDF 中提取出的行内特殊数学符号（如 $\mathcal{S}, \mathcal{A}, \mathcal{P}, \gamma$）可能缺失字体码位，redaction 会抹除它们；

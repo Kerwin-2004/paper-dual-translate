@@ -20,8 +20,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     import config as PDT  # 统一的可配置路径层（可迁移的关键）
+    import provenance as PROV
 except Exception:          # 单独把脚本拷出去用也不能崩
     PDT = None
+    import provenance as PROV
 
 # 候选 CJK 字体（按优先级）
 # ⚠️ 必须用"文字能正确提取"的字体：Noto Serif/Sans SC、SourceHanSerif 系列经
@@ -315,10 +317,11 @@ def insert_fitted(page, rect, text, fontname, fontfile, color, start_size, align
 
 
 def validate_translation_identities(blocks_data: dict, trans: dict):
-    expected = {
-        b["id"]: {"source_hash": b.get("source_hash"), "layout_uid": b.get("layout_uid")}
-        for p in blocks_data.get("pages", []) for b in p.get("blocks", [])
-    }
+    expected = {}
+    for page in blocks_data.get("pages", []):
+        page_no = int(page.get("page", 0))
+        for block in page.get("blocks", []):
+            expected[block["id"]] = PROV.block_identity(page_no, block)
     mismatch = []
     unverified = 0
     strict_v4 = int(blocks_data.get("schema_version", 0) or 0) >= 4

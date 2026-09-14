@@ -95,6 +95,20 @@ class FlowV4Tests(unittest.TestCase):
         self.assertEqual([M.block_text(part) for part in left],
                          ["First paragraph.", "Second paragraph."])
 
+    def test_table_edge_splits_caption_from_header_in_same_raw_block(self):
+        raw = {
+            "type": 0, "bbox": [40, 90, 560, 210],
+            "lines": [
+                {"bbox": [40, 90, 300, 102], "spans": [{"text": "Table 1. Results"}]},
+                {"bbox": [40, 106, 300, 118], "spans": [{"text": "continued caption"}]},
+                {"bbox": [40, 145, 560, 157], "spans": [{"text": "Method Score"}]},
+                {"bbox": [40, 195, 560, 207], "spans": [{"text": "body below"}]},
+            ],
+        }
+        parts = M.split_at_horizontal_boundaries(raw, [140, 180])
+        self.assertEqual([M.block_text(part) for part in parts], [
+            "Table 1. Results continued caption", "Method Score", "body below"])
+
     def test_wide_layout_barrier_splits_reading_zones(self):
         blocks = [
             blk("left top", 80, 100),
@@ -106,12 +120,38 @@ class FlowV4Tests(unittest.TestCase):
             blocks, [{"kind": "image", "bbox": [80, 250, 520, 400]}], 600)
         self.assertEqual([item["text"] for item in out],
                          ["left top", "right top", "left bottom", "right bottom"])
+        self.assertTrue(out[2]["flow_break"])
 
     def test_adjacent_vector_parts_form_one_wide_barrier(self):
         clusters = M.cluster_object_rects([
             [60, 200, 260, 300], [280, 200, 520, 300],
         ])
         self.assertEqual(clusters, [[60.0, 200.0, 520.0, 300.0]])
+
+    def test_heading_at_page_boundary_prevents_false_continuation(self):
+        previous = {"page": 1, "blocks": [
+            {**blk("unfinished sentence", 700, 720), "flow_index": 0},
+        ]}
+        following = {"page": 2, "blocks": [
+            {**blk("New section", 40, 60, kind="heading"), "flow_index": 0},
+            {**blk("body starts here", 70, 90), "flow_index": 1},
+        ]}
+        M.mark_page_continuations([previous, following])
+        self.assertNotIn("continues_to_next", previous["blocks"][0])
+        self.assertNotIn("continues_from_prev", following["blocks"][1])
+
+    def test_meta_at_page_boundary_does_not_block_continuation(self):
+        previous = {"page": 1, "blocks": [
+            {**blk("unfinished sentence", 700, 720), "flow_index": 0},
+            {**blk("12", 780, 790, kind="meta"), "flow_index": 1},
+        ]}
+        following = {"page": 2, "blocks": [
+            {**blk("Journal header", 10, 20, kind="meta"), "flow_index": 0},
+            {**blk("continues here.", 40, 60), "flow_index": 1},
+        ]}
+        M.mark_page_continuations([previous, following])
+        self.assertTrue(previous["blocks"][0]["continues_to_next"])
+        self.assertTrue(following["blocks"][1]["continues_from_prev"])
 
 
 if __name__ == "__main__":

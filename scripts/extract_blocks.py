@@ -258,6 +258,35 @@ def split_raw_block(block: dict, page_w: float) -> list[dict]:
     return sorted(fragments, key=lambda fragment: (fragment["bbox"][1], fragment["bbox"][0]))
 
 
+def split_at_horizontal_boundaries(block: dict, boundaries: list[float]) -> list[dict]:
+    """Split physical lines at table edges before caption/table classification."""
+    lines = [line for line in block.get("lines", []) if line.get("bbox")]
+    cuts = sorted(float(value) for value in boundaries
+                  if float(block["bbox"][1]) < float(value) < float(block["bbox"][3]))
+    if len(lines) < 2 or not cuts:
+        return [block]
+    groups: dict[int, list[dict]] = {}
+    for line in lines:
+        center = (float(line["bbox"][1]) + float(line["bbox"][3])) / 2
+        band = sum(center >= cut for cut in cuts)
+        groups.setdefault(band, []).append(line)
+    if len(groups) < 2:
+        return [block]
+    fragments = []
+    for band in sorted(groups):
+        selected = groups[band]
+        fragment = dict(block)
+        fragment["lines"] = selected
+        fragment["bbox"] = (
+            min(float(line["bbox"][0]) for line in selected),
+            min(float(line["bbox"][1]) for line in selected),
+            max(float(line["bbox"][2]) for line in selected),
+            max(float(line["bbox"][3]) for line in selected),
+        )
+        fragments.append(fragment)
+    return fragments
+
+
 def cluster_object_rects(rects: list[list[float]], padding: float = 24.0) -> list[list[float]]:
     """Union nearby drawing/image rectangles into composite figure regions."""
     groups: list[list[float]] = []
@@ -421,45 +450,61 @@ def assign_flow(blocks: list[dict], layout_barriers: list[dict], page_w: float) 
     ordered, used = [], set()
     cursor_y = -1e9
 
-    def emit_zone(y0, y1):
+    def emit_zone(y0, y1, break_before=False):
         zone = [
             b for b in non_full if id(b) not in used
             and y0 <= ((b["bbox"][1] + b["bbox"][3]) / 2) < y1
         ]
         left = sorted((b for b in zone if b["column"] == "left"), key=lambda b: (b["bbox"][1], b["bbox"][0]))
         right = sorted((b for b in zone if b["column"] == "right"), key=lambda b: (b["bbox"][1], b["bbox"][0]))
-        for b in left + right:
+        sequence = left + right
+        if break_before and sequence and ordered:
+            sequence[0]["flow_break"] = True
+        for b in sequence:
             ordered.append(b)
             used.add(id(b))
 
+    pending_break = False
     for y0, y1, payload in barriers:
-        emit_zone(cursor_y, y0)
+        emit_zone(cursor_y, y0, pending_break)
         typ, obj = payload
         if typ == "block" and id(obj) not in used:
+            obj["flow_break"] = True
             ordered.append(obj)
             used.add(id(obj))
+        pending_break = True
         cursor_y = max(cursor_y, y1)
 
-    emit_zone(cursor_y, 1e9)
+    emit_zone(cursor_y, 1e9, pending_break)
     leftovers = [b for b in blocks if id(b) not in used]
     leftovers.sort(key=lambda b: (b["bbox"][1], 0 if b["column"] == "left" else 1, b["bbox"][0]))
     ordered.extend(leftovers)
 
     for idx, b in enumerate(ordered):
         b["flow_index"] = idx
+        if b.get("kind") in {"heading", "table", "table_caption", "figure_caption"}:
+            b["flow_break"] = True
     return ordered
 
 
 def mark_page_continuations(pages):
+    def substantive(page):
+        return [
+            block for block in sorted(
+                page.get("blocks", []), key=lambda item: item.get("flow_index", 10**9))
+            if block.get("kind") != "meta"
+        ]
+
     for i in range(len(pages) - 1):
         if int(pages[i + 1].get("page", 0)) != int(pages[i].get("page", 0)) + 1:
             continue
-        left = [b for b in pages[i]["blocks"] if b.get("kind") == "body"]
-        right = [b for b in pages[i + 1]["blocks"] if b.get("kind") == "body"]
+        left = substantive(pages[i])
+        right = substantive(pages[i + 1])
         if not left or not right:
             continue
-        last = max(left, key=lambda x: x.get("flow_index", -1))
-        first = min(right, key=lambda x: x.get("flow_index", 10**9))
+        last, first = left[-1], right[0]
+        if last.get("kind") != "body" or first.get("kind") != "body":
+            continue
         lt, ft = last["text"].rstrip(), first["text"].lstrip()
         if (lt and not lt.endswith(TERMINAL)) or LOWER_START.match(ft):
             last["continues_to_next"] = True
@@ -502,7 +547,12 @@ def main(argv=None) -> int:
         for raw_index, source_block in enumerate(d.get("blocks", [])):
             if source_block.get("type") != 0:
                 continue
-            for fragment_index, rb in enumerate(split_raw_block(source_block, page.rect.width)):
+            fragments = []
+            boundaries = [edge for region in table_map.get(page_no, [])
+                          for edge in (region[1], region[3])]
+            for column_fragment in split_raw_block(source_block, page.rect.width):
+                fragments.extend(split_at_horizontal_boundaries(column_fragment, boundaries))
+            for fragment_index, rb in enumerate(fragments):
                 text = block_text(rb)
                 if len(text) < args.min_chars:
                     continue

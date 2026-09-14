@@ -94,55 +94,109 @@ def cluster_rules(rules, y_tol=30.0, x_overlap=0.5):
     return groups
 
 
-def caption_lines(page):
-    """找出所有 "Table N" 题注块，并保留多行题注的完整 bbox。"""
+def _text_line(line):
+    spans = [span for span in line.get("spans", []) if clean(span.get("text", ""))]
+    if not spans:
+        return None
+    text = clean("".join(span.get("text", "") for span in spans))
+    boxes = [span.get("bbox") for span in spans if span.get("bbox")]
+    bbox = (line.get("bbox") or [
+        min(box[0] for box in boxes), min(box[1] for box in boxes),
+        max(box[2] for box in boxes), max(box[3] for box in boxes)])
+    weighted = [(float(span.get("size", 0) or 0), max(1, len(clean(span.get("text", "")))))
+                for span in spans]
+    size = sum(value * weight for value, weight in weighted) / sum(weight for _, weight in weighted)
+    font_weights = {}
+    bold_weight = 0
+    for span, (_, weight) in zip(spans, weighted):
+        font = re.sub(r"(?i)(bold|italic|oblique|regular|medium)", "", span.get("font", ""))
+        font_weights[font] = font_weights.get(font, 0) + weight
+        if (int(span.get("flags", 0) or 0) & 16) or re.search(r"bold", span.get("font", ""), re.I):
+            bold_weight += weight
+    family = max(font_weights, key=font_weights.get) if font_weights else ""
+    gaps = [spans[i]["bbox"][0] - spans[i - 1]["bbox"][2]
+            for i in range(1, len(spans)) if spans[i].get("bbox") and spans[i - 1].get("bbox")]
+    return {"text": text, "bbox": [float(v) for v in bbox], "size": size,
+            "font_family": family, "bold_ratio": bold_weight / sum(weight for _, weight in weighted),
+            "tabular_gap": max(gaps, default=0.0)}
+
+
+def caption_lines(page, rules):
+    """Collect caption lines only up to the first table rule or structure break."""
     caps = []
     for b in page.get_text("dict")["blocks"]:
         if b.get("type") != 0:
             continue
-        lines = [clean("".join(s.get("text", "") for s in ln.get("spans", [])))
-                 for ln in b.get("lines", [])]
-        txt = clean(" ".join(line for line in lines if line))
-        m = re.match(r"Table\s+(\d+)\b", txt, re.I)
-        if m:
-            x0, y0, x1, y1 = b["bbox"]
-            caps.append({"num": int(m.group(1)), "text": txt,
-                         "y": y0, "y1": y1, "x0": x0, "x1": x1,
-                         "bbox": [x0, y0, x1, y1],
-                         "xc": (x0 + x1) / 2})
+        lines = [record for line in b.get("lines", [])
+                 if (record := _text_line(line)) is not None]
+        start = next((i for i, line in enumerate(lines)
+                      if re.match(r"Table\s+(\d+)\b", line["text"], re.I)), None)
+        if start is None:
+            continue
+        match = re.match(r"Table\s+(\d+)\b", lines[start]["text"], re.I)
+        first = lines[start]
+        rule_y = min((y for y, x0, x1 in rules
+                      if y >= first["bbox"][3] - 1
+                      and _overlap(x0, x1, first["bbox"][0], first["bbox"][2]) >= 0.2),
+                     default=None)
+        kept = []
+        previous = None
+        for line in lines[start:]:
+            if previous is not None:
+                gap = line["bbox"][1] - previous["bbox"][3]
+                if rule_y is not None and line["bbox"][1] >= rule_y - 1:
+                    break
+                if gap > max(6.0, (previous["bbox"][3] - previous["bbox"][1]) * 0.9):
+                    break
+                if abs(line["size"] - first["size"]) > 0.9:
+                    break
+                if line["font_family"] != first["font_family"]:
+                    break
+                if abs(line["bold_ratio"] - first["bold_ratio"]) > 0.65:
+                    break
+                if line["tabular_gap"] > max(24.0, page.rect.width * 0.05):
+                    break
+            kept.append(line)
+            previous = line
+        if not kept:
+            continue
+        x0 = min(line["bbox"][0] for line in kept)
+        y0 = min(line["bbox"][1] for line in kept)
+        x1 = max(line["bbox"][2] for line in kept)
+        y1 = max(line["bbox"][3] for line in kept)
+        txt = clean(" ".join(line["text"] for line in kept))
+        caps.append({"num": int(match.group(1)), "text": txt,
+                     "y": y0, "y1": y1, "x0": x0, "x1": x1,
+                     "bbox": [x0, y0, x1, y1], "xc": (x0 + x1) / 2})
     return sorted(caps, key=lambda c: (c["y"], c["x0"]))
 
 
-def group_by_caption(rules, caps, page_mid):
-    """题注锚定：每条横线归属到"它上方最近的那个题注"。
-
-    细节：
-    - 题注必须在横线**上方**（只留 2pt 余量）。否则下一张表的题注会把
-      上一张表的底边抢走，导致两张表都被切坏。
-    - 并排两张表题注 y 相同时（page12 的表 3 与表 4），按横线中心与题注中心
-      是否在同一半页来裁决。
-    """
+def group_by_caption(rules, caps, page_mid, max_caption_gap=80.0):
+    """Cluster rules into candidate tables, then match each cluster to a nearby caption."""
     groups = []
-    for y, x0, x1 in rules:
+    candidates = cluster_rules(rules, y_tol=72.0, x_overlap=0.5)
+    for candidate in candidates:
+        if len(candidate["ys"]) < 2:
+            continue
+        y, x0, x1 = candidate["y0"], candidate["x0"], candidate["x1"]
         xc = (x0 + x1) / 2
-        cands = [c for c in caps if c["y"] <= y + 2]
+        cands = [c for c in caps
+                 if c["y1"] <= y + 2
+                 and 0 <= y - c["y1"] <= max_caption_gap
+                 and (_overlap(x0, x1, c["x0"], c["x1"]) >= 0.2
+                      or (c["xc"] < page_mid) == (xc < page_mid))]
         if not cands:
             continue
-        best_dy = min(y - c["y"] for c in cands)
-        tied = [c for c in cands if (y - c["y"]) <= best_dy + 8]
+        best_dy = min(y - c["y1"] for c in cands)
+        tied = [c for c in cands if (y - c["y1"]) <= best_dy + 8]
         if len(tied) == 1:
             best = tied[0]
         else:
             same_side = [c for c in tied if (c["xc"] < page_mid) == (xc < page_mid)]
             pool = same_side or tied
             best = min(pool, key=lambda c: abs(xc - c["xc"]))
-        g = next((x for x in groups if x["cap"] is best), None)
-        if g is None:
-            g = {"cap": best, "ys": [], "x0": x0, "x1": x1}
-            groups.append(g)
-        g["ys"].append(y)
-        g["x0"] = min(g["x0"], x0)
-        g["x1"] = max(g["x1"], x1)
+        groups.append({"cap": best, "ys": list(candidate["ys"]),
+                       "x0": x0, "x1": x1})
     for g in groups:
         g["ys"] = sorted(set(g["ys"]))
         g["y0"] = min(g["ys"])
@@ -208,7 +262,7 @@ def main(argv=None) -> int:
         rules = horizontal_rules(page)
         if not rules:
             continue
-        caps = caption_lines(page)
+        caps = caption_lines(page, rules)
         if caps:
             groups = group_by_caption(rules, caps, page.rect.width / 2)
             mode = "题注锚定"

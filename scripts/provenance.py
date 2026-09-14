@@ -36,6 +36,29 @@ def block_layout_uid(page: int, column: str, bbox, text: str) -> str:
     return hashlib.sha256(payload).hexdigest()[:24]
 
 
+def block_identity(page: int, block: dict) -> dict[str, str]:
+    """Compute identity from the block's current content and final geometry."""
+    text = block.get("text", "")
+    return {
+        "source_hash": block_source_hash(page, text),
+        "layout_uid": block_layout_uid(
+            page, block.get("column", "?"), block.get("bbox", ()), text),
+    }
+
+
+def refresh_block_identities(blocks_data: dict) -> int:
+    """Refresh identities after every preprocessing mutation; return change count."""
+    changed = 0
+    for page in blocks_data.get("pages", []):
+        page_no = int(page.get("page", 0))
+        for block in page.get("blocks", []):
+            identity = block_identity(page_no, block)
+            if any(block.get(field) != value for field, value in identity.items()):
+                changed += 1
+            block.update(identity)
+    return changed
+
+
 def file_record(path: str | Path) -> dict:
     p = Path(path).resolve()
     st = p.stat()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 import threading
@@ -19,6 +20,7 @@ import auto_translate  # noqa: E402
 import build_dual  # noqa: E402
 import config  # noqa: E402
 import extract_blocks  # noqa: E402
+import extract_tables  # noqa: E402
 import merge_paragraphs  # noqa: E402
 import pipeline  # noqa: E402
 import provenance  # noqa: E402
@@ -88,6 +90,45 @@ class PipelineTests(unittest.TestCase):
                     "--work-dir", str(work), "--python", sys.executable,
                 ])
             self.assertEqual(rc, 2)
+
+    def test_prepare_refreshes_identity_after_mutating_steps(self):
+        with tempfile.TemporaryDirectory() as td_raw:
+            td = Path(td_raw)
+            source = td / "source.pdf"
+            source.write_bytes(b"fixture")
+            work = td / "work"
+
+            def fake_step(py_exe, script_name, args, desc, env=None):
+                if script_name == "extract_tables.py":
+                    out = Path(args[args.index("--output") + 1])
+                    out.write_text('{"pages": []}', encoding="utf-8")
+                elif script_name == "extract_blocks.py":
+                    out = Path(args[args.index("--output") + 1])
+                    block = {"id": "p1b0", "text": "same", "column": "left",
+                             "bbox": [10, 20, 200, 40]}
+                    block.update(provenance.block_identity(1, block))
+                    out.write_text(
+                        json.dumps({"schema_version": 4, "pages": [
+                            {"page": 1, "blocks": [block]}]}), encoding="utf-8")
+                elif script_name == "audit_nested_blocks.py":
+                    path = Path(args[args.index("--blocks") + 1])
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    data["pages"][0]["blocks"][0]["bbox"][2] = 260
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                return 0
+
+            check = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with mock.patch.object(pipeline.subprocess, "run", return_value=check), \
+                    mock.patch.object(pipeline, "run_step", side_effect=fake_step), \
+                    redirect_stdout(io.StringIO()):
+                rc = pipeline.main([
+                    "--source", str(source), "--mode", "prepare",
+                    "--work-dir", str(work), "--python", sys.executable,
+                ])
+            self.assertEqual(rc, 0)
+            data = json.loads((work / "blocks.json").read_text(encoding="utf-8"))
+            block = data["pages"][0]["blocks"][0]
+            self.assertEqual(block["layout_uid"], provenance.block_identity(1, block)["layout_uid"])
 
 
 class AutoTranslateTests(unittest.TestCase):
@@ -169,6 +210,41 @@ class AutoTranslateTests(unittest.TestCase):
         self.assertEqual([[item[0] for item in batch] for batch in batches],
                          [["a"], ["c", "d"]])
 
+    def test_structural_break_splits_adjacent_global_positions(self):
+        items = [("a", "alpha"), ("heading", "Section"), ("b", "beta")]
+        batches = auto_translate.make_flow_batches(
+            items, 1000, {"a": 0, "heading": 1, "b": 2}, {"heading"})
+        self.assertEqual([[item[0] for item in batch] for batch in batches],
+                         [["a"], ["heading"], ["b"]])
+
+    def test_dry_run_uses_skipped_blocks_in_global_flow_positions(self):
+        with tempfile.TemporaryDirectory() as td_raw:
+            td = Path(td_raw)
+            blocks_path = td / "blocks.json"
+            blocks = [
+                {"id": "a", "text": "A sufficiently long body paragraph ends here.",
+                 "kind": "body", "column": "left", "bbox": [40, 100, 260, 130],
+                 "flow_index": 0},
+                {"id": "table", "text": "table cell", "kind": "table",
+                 "column": "full", "bbox": [40, 150, 560, 250], "flow_index": 1},
+                {"id": "b", "text": "Another sufficiently long body paragraph starts here.",
+                 "kind": "body", "column": "left", "bbox": [40, 280, 260, 310],
+                 "flow_index": 2},
+            ]
+            blocks_path.write_text(json.dumps({
+                "schema_version": 4, "page_count": 2,
+                "pages": [{"page": 2, "width": 600, "height": 800,
+                           "blocks": blocks}],
+            }), encoding="utf-8")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = auto_translate.main([
+                    "--blocks", str(blocks_path),
+                    "--output", str(td / "translations.json"), "--dry-run",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertIn("-> 2 批", output.getvalue())
+
 
 class ParagraphFlowTests(unittest.TestCase):
     def test_pdf_physical_lines_are_joined_inside_one_block(self):
@@ -225,6 +301,16 @@ class ProvenanceTests(unittest.TestCase):
         right = provenance.block_layout_uid(1, "right", [310, 20, 500, 40], "same")
         self.assertNotEqual(left, right)
 
+    def test_refresh_identity_tracks_final_bbox(self):
+        block = {"id": "p1b0", "text": "same", "column": "left",
+                 "bbox": [10, 20, 200, 40]}
+        data = {"pages": [{"page": 1, "blocks": [block]}]}
+        provenance.refresh_block_identities(data)
+        before = block["layout_uid"]
+        block["bbox"][2] = 240
+        self.assertEqual(provenance.refresh_block_identities(data), 1)
+        self.assertNotEqual(block["layout_uid"], before)
+
     def test_manifest_detects_replaced_source(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -247,33 +333,79 @@ class ProvenanceTests(unittest.TestCase):
 
 class TranslationHashTests(unittest.TestCase):
     def test_build_rejects_mismatched_translation_hash(self):
-        blocks = {"pages": [{"page": 1, "blocks": [
-            {"id": "p1b0", "source_hash": "new", "layout_uid": "layout"}
-        ]}]}
+        block = {"id": "p1b0", "text": "new", "column": "left",
+                 "bbox": [10, 20, 200, 40]}
+        identity = provenance.block_identity(1, block)
+        blocks = {"pages": [{"page": 1, "blocks": [block]}]}
         mismatch, unverified = build_dual.validate_translation_hashes(
             blocks, {"p1b0": {"zh": "译文", "source_hash": "old",
-                               "layout_uid": "layout"}})
+                               "layout_uid": identity["layout_uid"]}})
         self.assertEqual(len(mismatch), 1)
         self.assertEqual(unverified, 0)
 
     def test_v4_missing_layout_uid_is_unverified(self):
-        blocks = {"schema_version": 4, "pages": [{"page": 1, "blocks": [
-            {"id": "p1b0", "source_hash": "source", "layout_uid": "layout"}
-        ]}]}
+        block = {"id": "p1b0", "text": "source", "column": "left",
+                 "bbox": [10, 20, 200, 40]}
+        identity = provenance.block_identity(1, block)
+        blocks = {"schema_version": 4, "pages": [{"page": 1, "blocks": [block]}]}
         mismatch, unverified = build_dual.validate_translation_identities(
-            blocks, {"p1b0": {"zh": "译文", "source_hash": "source"}})
+            blocks, {"p1b0": {"zh": "译文", "source_hash": identity["source_hash"]}})
         self.assertEqual(mismatch, [])
         self.assertEqual(unverified, 1)
 
     def test_same_text_swap_is_rejected_by_layout_uid(self):
-        blocks = {"schema_version": 4, "pages": [{"page": 1, "blocks": [
-            {"id": "p1b0", "source_hash": "same", "layout_uid": "left"}
-        ]}]}
+        block = {"id": "p1b0", "text": "same", "column": "left",
+                 "bbox": [10, 20, 200, 40]}
+        identity = provenance.block_identity(1, block)
+        blocks = {"schema_version": 4, "pages": [{"page": 1, "blocks": [block]}]}
         mismatch, unverified = build_dual.validate_translation_identities(
-            blocks, {"p1b0": {"zh": "译文", "source_hash": "same",
+            blocks, {"p1b0": {"zh": "译文", "source_hash": identity["source_hash"],
                                "layout_uid": "right"}})
         self.assertEqual(mismatch[0][1], "layout_uid")
         self.assertEqual(unverified, 0)
+
+    def test_build_recomputes_layout_uid_instead_of_trusting_stored_value(self):
+        block = {"id": "p1b0", "text": "same", "column": "left",
+                 "bbox": [10, 20, 200, 40]}
+        old = provenance.block_identity(1, block)
+        block.update(old)
+        block["bbox"] = [10, 20, 260, 40]
+        blocks = {"schema_version": 4, "pages": [{"page": 1, "blocks": [block]}]}
+        mismatch, unverified = build_dual.validate_translation_identities(
+            blocks, {"p1b0": {"zh": "译文", **old}})
+        self.assertEqual(mismatch[0][1], "layout_uid")
+        self.assertEqual(unverified, 0)
+
+
+class TableExtractionTests(unittest.TestCase):
+    def test_caption_stops_before_rule_inside_same_text_block(self):
+        def line(text, y0, y1, x0=40, x1=300, size=10):
+            return {"bbox": [x0, y0, x1, y1], "spans": [
+                {"text": text, "bbox": [x0, y0, x1, y1], "size": size}]}
+
+        block = {"type": 0, "lines": [
+            line("Table 1. Applications of", 90, 100),
+            line("language models.", 102, 112),
+            line("Method                         Score", 125, 135),
+        ]}
+        page = SimpleNamespace(
+            rect=SimpleNamespace(width=600),
+            get_text=lambda mode: {"blocks": [block]},
+        )
+        captions = extract_tables.caption_lines(page, [(120, 40, 560)])
+        self.assertEqual(len(captions), 1)
+        self.assertEqual(captions[0]["text"],
+                         "Table 1. Applications of language models.")
+        self.assertLess(captions[0]["bbox"][3], 120)
+
+    def test_distant_rule_cluster_is_not_attached_to_caption(self):
+        caps = [{"text": "Table 1", "bbox": [40, 90, 200, 110],
+                 "y": 90, "y1": 110, "x0": 40, "x1": 200, "xc": 120}]
+        rules = [(180, 40, 560), (220, 40, 560), (260, 40, 560),
+                 (500, 40, 560), (530, 40, 560)]
+        groups = extract_tables.group_by_caption(rules, caps, 300)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["y1"], 260)
 
 
 if __name__ == "__main__":
