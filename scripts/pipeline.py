@@ -118,6 +118,8 @@ def main(argv=None) -> int:
     ap.add_argument("--font", default=None, help="指定 CJK 正文字体文件路径")
     ap.add_argument("--font-scale", type=float, default=1.2, help="中文字号自适应起始倍率 (默认 1.2)")
     ap.add_argument("--no-indent", action="store_true", help="关闭中文首行缩进 (段首空两格)")
+    ap.add_argument("--allow-unverified-translations", action="store_true",
+                    help="允许 schema v4 构建缺少身份字段的旧手工译文")
     ap.add_argument("--preview", default=None, help="预览图输出路径 (PNG)")
     ap.add_argument("--preview-pages", default="1", help="预览哪些页 (1-based)")
     
@@ -386,6 +388,8 @@ def main(argv=None) -> int:
             build_args += ["--font", str(args.font)]
         if args.no_indent:
             build_args.append("--no-indent")
+        if args.allow_unverified_translations:
+            build_args.append("--allow-unverified-translations")
         if args.preview:
             build_args += ["--preview", str(args.preview), "--preview-pages", str(args.preview_pages)]
 

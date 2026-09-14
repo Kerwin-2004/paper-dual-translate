@@ -100,15 +100,17 @@ python scripts/audit_nested_blocks.py --blocks work/blocks.json --apply --skelet
 python scripts/merge_paragraphs.py --blocks work/blocks.json --tables work/tables.json --apply
 ```
 
+流序图中的橙色虚线框表示跨栏图片、宽矢量图或表格 barrier；编号应在 barrier 上下分别按左栏、右栏推进。
+
 ### 2. 翻译（两种做法，产出格式一致）
 
 **做法 A（agent 直译，默认）**：Agent 读 `blocks.json`，逐块产出 `translations.json`：
 
 ```json
 {
-  "p1b3":  {"zh": "DuSA：一种面向自动驾驶的 LLM 引导强化学习双环自学习框架", "source_hash": "<复制原块哈希>"},
-  "p1b4":  {"skip": true, "source_hash": "<复制原块哈希>"},
-  "p7b10": {"blank": true, "source_hash": "<复制原块哈希>"}
+  "p1b3":  {"zh": "DuSA：一种面向自动驾驶的 LLM 引导强化学习双环自学习框架", "source_hash": "<复制原块哈希>", "layout_uid": "<复制版面身份>"},
+  "p1b4":  {"skip": true, "source_hash": "<复制原块哈希>", "layout_uid": "<复制版面身份>"},
+  "p7b10": {"blank": true, "source_hash": "<复制原块哈希>", "layout_uid": "<复制版面身份>"}
 }
 ```
 
@@ -116,6 +118,10 @@ python scripts/merge_paragraphs.py --blocks work/blocks.json --tables work/table
 - `skip` —— 保留英文原样（页眉、DOI、作者、参考文献、纯公式块、表格所在块）
 - `blank` —— 只抹掉原文不写新字（用于把跨行片段并到相邻块时清残留）
 - `source_hash` —— 从对应 `blocks.json` 块原样复制；构建时用于拒绝错配的旧译文
+- `layout_uid` —— 同样原样复制；用页码、列、bbox 与文本识别同文异位或块交换
+
+schema v4 默认要求两个身份字段齐全。确实需要构建旧手工译文时，可显式增加
+`--allow-unverified-translations`；重新抽取后应优先新建 work 目录并重新翻译。
 
 表格译文写成一个**词条字典**（同名单元格自动共用一条）：
 

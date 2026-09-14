@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """paper-dual-translate / extract_blocks.py
 
-v4 column-aware paragraph extractor:
+v4.1 column-aware paragraph extractor:
 raw PDF blocks -> table isolation -> left/right/full classification
 -> column-local paragraph merge -> explicit flow_index.
 """
@@ -83,6 +83,14 @@ def source_hash(page: int, bbox: list[float], text: str) -> str:
     return hashlib.sha256(f"{int(page)}\0{norm}".encode("utf-8")).hexdigest()[:24]
 
 
+def layout_uid(page: int, column: str, bbox: list[float], text: str) -> str:
+    if PROV is not None:
+        return PROV.block_layout_uid(page, column, bbox, text)
+    norm = re.sub(r"\s+", " ", (text or "").strip())
+    coords = ",".join(f"{round(float(v) * 2) / 2:.1f}" for v in bbox)
+    return hashlib.sha256(f"{int(page)}\0{column}\0{coords}\0{norm}".encode("utf-8")).hexdigest()[:24]
+
+
 def overlap_ratio(a, b) -> float:
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
@@ -138,6 +146,12 @@ def main_metrics(block: dict):
 
 
 def classify_kind(text, bbox, page_w, page_h, bold, main_font, math_only, table_regions):
+    # Captions remain independent translation units even when a loose table
+    # detector includes part of the caption in its region.
+    if CAPTION_TABLE.match(text):
+        return "table_caption"
+    if CAPTION_FIG.match(text):
+        return "figure_caption"
     if any(overlap_ratio(bbox, r) >= 0.25 for r in table_regions):
         return "table"
     if PAGE_NO.match(text):
@@ -146,10 +160,6 @@ def classify_kind(text, bbox, page_w, page_h, bold, main_font, math_only, table_
         return "meta"
     if REF_HEAD.match(text):
         return "reference_heading"
-    if CAPTION_TABLE.match(text):
-        return "table_caption"
-    if CAPTION_FIG.match(text):
-        return "figure_caption"
     if math_only:
         return "math_only"
     short = len(text) <= 130
@@ -170,6 +180,47 @@ def classify_column(bbox, page_w: float) -> str:
     return "left" if (x0 + x1) / 2 < mid else "right"
 
 
+def _line_text(line: dict) -> str:
+    return clean_text("".join(span.get("text", "") for span in line.get("spans", [])))
+
+
+def _line_size(line: dict) -> float:
+    sizes = [(float(span.get("size", 0) or 0), max(1, len(span.get("text", ""))))
+             for span in line.get("spans", [])]
+    if not sizes:
+        return 9.0
+    totals: dict[float, int] = {}
+    for size, weight in sizes:
+        totals[round(size, 1)] = totals.get(round(size, 1), 0) + weight
+    return max(totals.items(), key=lambda item: item[1])[0]
+
+
+def split_line_runs(lines: list[dict]) -> list[list[dict]]:
+    """Split same-column physical lines into paragraph-like runs."""
+    ordered = sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0]))
+    runs: list[list[dict]] = []
+    for line in ordered:
+        if not runs:
+            runs.append([line])
+            continue
+        prev = runs[-1][-1]
+        prev_size, size = _line_size(prev), _line_size(line)
+        gap = float(line["bbox"][1]) - float(prev["bbox"][3])
+        indent = float(line["bbox"][0]) - float(prev["bbox"][0])
+        prev_text, text = _line_text(prev).rstrip(), _line_text(line).lstrip()
+        starts_structure = bool(LIST_START.match(text))
+        new_indented_paragraph = (
+            indent >= max(7.0, 0.7 * min(prev_size, size))
+            and prev_text.endswith(TERMINAL)
+        )
+        if (abs(prev_size - size) > 1.0 or gap > 1.1 * max(5.0, min(prev_size, size))
+                or starts_structure or new_indented_paragraph):
+            runs.append([line])
+        else:
+            runs[-1].append(line)
+    return runs
+
+
 def split_raw_block(block: dict, page_w: float) -> list[dict]:
     """Split a PyMuPDF text block when it contains lines from both columns.
 
@@ -185,7 +236,9 @@ def split_raw_block(block: dict, page_w: float) -> list[dict]:
     by_column: dict[str, list[dict]] = {"left": [], "right": [], "full": []}
     for line in lines:
         by_column[classify_column(line["bbox"], page_w)].append(line)
-    if not by_column["left"] or not by_column["right"]:
+    has_columns = bool(by_column["left"] and by_column["right"])
+    has_full_and_column = bool(by_column["full"] and (by_column["left"] or by_column["right"]))
+    if not (has_columns or has_full_and_column):
         return [block]
 
     fragments = []
@@ -193,15 +246,89 @@ def split_raw_block(block: dict, page_w: float) -> list[dict]:
         selected = by_column[column]
         if not selected:
             continue
-        x0 = min(float(line["bbox"][0]) for line in selected)
-        y0 = min(float(line["bbox"][1]) for line in selected)
-        x1 = max(float(line["bbox"][2]) for line in selected)
-        y1 = max(float(line["bbox"][3]) for line in selected)
-        fragment = dict(block)
-        fragment["bbox"] = (x0, y0, x1, y1)
-        fragment["lines"] = selected
-        fragments.append(fragment)
-    return fragments
+        for run in split_line_runs(selected):
+            x0 = min(float(line["bbox"][0]) for line in run)
+            y0 = min(float(line["bbox"][1]) for line in run)
+            x1 = max(float(line["bbox"][2]) for line in run)
+            y1 = max(float(line["bbox"][3]) for line in run)
+            fragment = dict(block)
+            fragment["bbox"] = (x0, y0, x1, y1)
+            fragment["lines"] = run
+            fragments.append(fragment)
+    return sorted(fragments, key=lambda fragment: (fragment["bbox"][1], fragment["bbox"][0]))
+
+
+def cluster_object_rects(rects: list[list[float]], padding: float = 24.0) -> list[list[float]]:
+    """Union nearby drawing/image rectangles into composite figure regions."""
+    groups: list[list[float]] = []
+    for rect in rects:
+        x0, y0, x1, y1 = [float(v) for v in rect]
+        if x1 - x0 <= 2.0 and y1 - y0 <= 2.0:
+            continue
+        merged = [x0, y0, x1, y1]
+        changed = True
+        while changed:
+            changed = False
+            remaining = []
+            for group in groups:
+                touches = not (
+                    merged[2] + padding < group[0] or group[2] + padding < merged[0]
+                    or merged[3] + padding < group[1] or group[3] + padding < merged[1]
+                )
+                if touches:
+                    merged = [min(merged[0], group[0]), min(merged[1], group[1]),
+                              max(merged[2], group[2]), max(merged[3], group[3])]
+                    changed = True
+                else:
+                    remaining.append(group)
+            groups = remaining
+        groups.append(merged)
+    return groups
+
+
+def detect_layout_barriers(page, table_regions: list[list[float]]) -> list[dict]:
+    """Find wide non-text objects that split upper and lower reading zones."""
+    page_w, page_h = float(page.rect.width), float(page.rect.height)
+    candidates: list[dict] = [
+        {"kind": "table", "bbox": [float(v) for v in region]}
+        for region in table_regions
+        if (float(region[2]) - float(region[0])) >= page_w * 0.55
+    ]
+    image_rects = []
+    try:
+        for info in page.get_image_info():
+            bbox = [float(v) for v in info.get("bbox", ())]
+            if len(bbox) == 4:
+                image_rects.append(bbox)
+    except (AttributeError, RuntimeError, ValueError):
+        pass
+    candidates.extend({"kind": "image", "bbox": bbox}
+                      for bbox in cluster_object_rects(image_rects))
+    drawing_rects = []
+    try:
+        for drawing in page.get_drawings():
+            rect = drawing.get("rect")
+            if rect is not None:
+                drawing_rects.append([rect.x0, rect.y0, rect.x1, rect.y1])
+    except (AttributeError, RuntimeError, ValueError):
+        pass
+    candidates.extend({"kind": "vector", "bbox": bbox}
+                      for bbox in cluster_object_rects(drawing_rects))
+
+    out = []
+    for candidate in candidates:
+        x0, y0, x1, y1 = candidate["bbox"]
+        width, height = x1 - x0, y1 - y0
+        area_ratio = max(0.0, width * height) / max(1.0, page_w * page_h)
+        if width < page_w * 0.55 or height < 10.0 or area_ratio > 0.72:
+            continue
+        bbox = [round(v, 2) for v in (x0, y0, x1, y1)]
+        if any(existing["kind"] == candidate["kind"]
+               and all(abs(a - b) <= 1.0 for a, b in zip(existing["bbox"], bbox))
+               for existing in out):
+            continue
+        out.append({"kind": candidate["kind"], "bbox": bbox})
+    return sorted(out, key=lambda item: (item["bbox"][1], item["bbox"][0]))
 
 
 def horizontal_overlap(a, b) -> float:
@@ -228,6 +355,12 @@ def can_merge(a: dict, b: dict) -> bool:
     ta = a["text"].rstrip()
     tb = b["text"].lstrip()
 
+    indent_delta = float(b["bbox"][0]) - float(a["bbox"][0])
+    if LIST_START.match(tb):
+        return False
+    if indent_delta >= 8.0 and ta.endswith(TERMINAL):
+        return False
+
     if gap <= 0.48 * size:
         return True
     if ta and not ta.endswith(TERMINAL):
@@ -235,9 +368,6 @@ def can_merge(a: dict, b: dict) -> bool:
     if LOWER_START.match(tb):
         return True
 
-    indent_delta = float(b["bbox"][0]) - float(a["bbox"][0])
-    if indent_delta >= 8.0 and ta.endswith(TERMINAL):
-        return False
     if gap <= 0.72 * size and abs(indent_delta) <= 4.0 and not LIST_START.match(tb):
         return True
     return False
@@ -278,13 +408,13 @@ def merge_column_blocks(blocks: list[dict]) -> list[dict]:
     return result
 
 
-def assign_flow(blocks: list[dict], table_regions: list[list[float]], page_w: float) -> list[dict]:
+def assign_flow(blocks: list[dict], layout_barriers: list[dict], page_w: float) -> list[dict]:
     """Wide objects form horizontal barriers; inside each zone read left column then right."""
     full = [b for b in blocks if b["column"] == "full"]
     barriers = [(float(b["bbox"][1]), float(b["bbox"][3]), ("block", b)) for b in full]
-    for r in table_regions:
-        if (r[2] - r[0]) >= page_w * 0.55:
-            barriers.append((float(r[1]), float(r[3]), ("table", r)))
+    for barrier in layout_barriers:
+        r = barrier["bbox"]
+        barriers.append((float(r[1]), float(r[3]), (barrier.get("kind", "layout"), r)))
     barriers.sort(key=lambda x: (x[0], x[1]))
 
     non_full = [b for b in blocks if b["column"] != "full"]
@@ -322,6 +452,8 @@ def assign_flow(blocks: list[dict], table_regions: list[list[float]], page_w: fl
 
 def mark_page_continuations(pages):
     for i in range(len(pages) - 1):
+        if int(pages[i + 1].get("page", 0)) != int(pages[i].get("page", 0)) + 1:
+            continue
         left = [b for b in pages[i]["blocks"] if b.get("kind") == "body"]
         right = [b for b in pages[i + 1]["blocks"] if b.get("kind") == "body"]
         if not left or not right:
@@ -356,7 +488,7 @@ def main(argv=None) -> int:
 
     result = {
         "schema_version": 4,
-        "extractor": "column-aware-paragraph-v4",
+        "extractor": "column-aware-paragraph-v4.1-layout-barriers",
         "source": str(src),
         "page_count": doc.page_count,
         "pages": [],
@@ -401,16 +533,20 @@ def main(argv=None) -> int:
         mergeable = [b for b in raw if b["kind"] != "table"]
         table_blocks = [b for b in raw if b["kind"] == "table"]
         merged = merge_column_blocks(mergeable)
-        ordered = assign_flow(merged + table_blocks, table_map.get(page_no, []), page.rect.width)
+        layout_barriers = detect_layout_barriers(page, table_map.get(page_no, []))
+        ordered = assign_flow(merged + table_blocks, layout_barriers, page.rect.width)
 
         for idx, b in enumerate(ordered):
             b["id"] = f"p{page_no}b{idx}"
             b.pop("_page", None)
+            b["source_hash"] = source_hash(page_no, b["bbox"], b["text"])
+            b["layout_uid"] = layout_uid(page_no, b["column"], b["bbox"], b["text"])
 
         result["pages"].append({
             "page": page_no,
             "width": round(page.rect.width, 2),
             "height": round(page.rect.height, 2),
+            "layout_barriers": layout_barriers,
             "blocks": ordered,
         })
 
@@ -423,7 +559,7 @@ def main(argv=None) -> int:
 
     total = sum(len(p["blocks"]) for p in result["pages"])
     body = sum(1 for p in result["pages"] for b in p["blocks"] if b["kind"] == "body")
-    print(f"v4 抽取完成: {len(result['pages'])} 页 / {total} 块 / 正文自然段 {body}")
+    print(f"v4.1 抽取完成: {len(result['pages'])} 页 / {total} 块 / 正文自然段 {body}")
     for p in result["pages"]:
         kinds = {}
         for b in p["blocks"]:

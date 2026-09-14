@@ -121,12 +121,16 @@ class AutoTranslateTests(unittest.TestCase):
     def test_resume_rejects_stale_or_unhashed_entries_when_hash_available(self):
         valid, stats = auto_translate.filter_resume_entries(
             {
-                "p1b0": {"zh": "甲", "source_hash": "same"},
-                "p1b1": {"zh": "乙", "source_hash": "old"},
+                "p1b0": {"zh": "甲", "source_hash": "same", "layout_uid": "l0"},
+                "p1b1": {"zh": "乙", "source_hash": "old", "layout_uid": "l1"},
                 "p1b2": {"zh": "丙"},
                 "gone": {"zh": "丁", "source_hash": "x"},
             },
-            {"p1b0": "same", "p1b1": "new", "p1b2": "h2"},
+            {
+                "p1b0": {"source_hash": "same", "layout_uid": "l0"},
+                "p1b1": {"source_hash": "new", "layout_uid": "l1"},
+                "p1b2": {"source_hash": "h2", "layout_uid": "l2"},
+            },
         )
         self.assertEqual(set(valid), {"p1b0"})
         self.assertEqual(stats["stale"], 1)
@@ -151,6 +155,20 @@ class AutoTranslateTests(unittest.TestCase):
         self.assertIn("previous page ending", messages[0]["content"])
         self.assertNotIn("previous page ending", messages[1]["content"])
 
+    def test_continuation_flags_are_sent_to_model(self):
+        messages = auto_translate.build_messages(
+            [("p2b0", "continued sentence")], [],
+            item_meta={"p2b0": {"continues_from_prev": True}},
+        )
+        self.assertIn('"continues_from_prev": true', messages[1]["content"])
+
+    def test_resume_gaps_start_new_batches(self):
+        items = [("a", "alpha"), ("c", "charlie"), ("d", "delta")]
+        batches = auto_translate.make_flow_batches(
+            items, 1000, {"a": 0, "c": 2, "d": 3})
+        self.assertEqual([[item[0] for item in batch] for batch in batches],
+                         [["a"], ["c", "d"]])
+
 
 class ParagraphFlowTests(unittest.TestCase):
     def test_pdf_physical_lines_are_joined_inside_one_block(self):
@@ -171,6 +189,13 @@ class ParagraphFlowTests(unittest.TestCase):
         self.assertEqual(
             build_dual.normalize_translation_text("line one\nline two"),
             "line one line two",
+        )
+
+    def test_cross_page_continuation_is_never_indented(self):
+        self.assertEqual(
+            build_dual.block_indent_prefix(
+                {"continues_from_prev": True}, "续句", "上一段。"),
+            "",
         )
 
     def test_geometry_merges_sentence_boundary_fragments(self):
@@ -195,6 +220,11 @@ class ProvenanceTests(unittest.TestCase):
             provenance.block_source_hash(3, "alpha beta gamma"),
         )
 
+    def test_layout_uid_distinguishes_same_text_at_different_positions(self):
+        left = provenance.block_layout_uid(1, "left", [10, 20, 200, 40], "same")
+        right = provenance.block_layout_uid(1, "right", [310, 20, 500, 40], "same")
+        self.assertNotEqual(left, right)
+
     def test_manifest_detects_replaced_source(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -218,11 +248,31 @@ class ProvenanceTests(unittest.TestCase):
 class TranslationHashTests(unittest.TestCase):
     def test_build_rejects_mismatched_translation_hash(self):
         blocks = {"pages": [{"page": 1, "blocks": [
-            {"id": "p1b0", "source_hash": "new"}
+            {"id": "p1b0", "source_hash": "new", "layout_uid": "layout"}
         ]}]}
         mismatch, unverified = build_dual.validate_translation_hashes(
-            blocks, {"p1b0": {"zh": "译文", "source_hash": "old"}})
+            blocks, {"p1b0": {"zh": "译文", "source_hash": "old",
+                               "layout_uid": "layout"}})
         self.assertEqual(len(mismatch), 1)
+        self.assertEqual(unverified, 0)
+
+    def test_v4_missing_layout_uid_is_unverified(self):
+        blocks = {"schema_version": 4, "pages": [{"page": 1, "blocks": [
+            {"id": "p1b0", "source_hash": "source", "layout_uid": "layout"}
+        ]}]}
+        mismatch, unverified = build_dual.validate_translation_identities(
+            blocks, {"p1b0": {"zh": "译文", "source_hash": "source"}})
+        self.assertEqual(mismatch, [])
+        self.assertEqual(unverified, 1)
+
+    def test_same_text_swap_is_rejected_by_layout_uid(self):
+        blocks = {"schema_version": 4, "pages": [{"page": 1, "blocks": [
+            {"id": "p1b0", "source_hash": "same", "layout_uid": "left"}
+        ]}]}
+        mismatch, unverified = build_dual.validate_translation_identities(
+            blocks, {"p1b0": {"zh": "译文", "source_hash": "same",
+                               "layout_uid": "right"}})
+        self.assertEqual(mismatch[0][1], "layout_uid")
         self.assertEqual(unverified, 0)
 
 

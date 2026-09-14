@@ -76,6 +76,13 @@ def indent_prefix(zh: str, prev_tail: str | None) -> str:
     return _INDENT
 
 
+def block_indent_prefix(block: dict, zh: str, prev_tail: str | None) -> str:
+    """Continuation metadata overrides punctuation-based indentation guesses."""
+    if block.get("continues_from_prev"):
+        return ""
+    return indent_prefix(zh, prev_tail)
+
+
 def _carry_from_page(blks: list, trans: dict, page_width: float) -> str | None:
     """按阅读序取某页最后一个已译非标题块的译文（页尾是标题则 None）。
 
@@ -307,23 +314,36 @@ def insert_fitted(page, rect, text, fontname, fontfile, color, start_size, align
     return None
 
 
-def validate_translation_hashes(blocks_data: dict, trans: dict):
-    expected = {b["id"]: b.get("source_hash")
-                for p in blocks_data.get("pages", []) for b in p.get("blocks", [])}
+def validate_translation_identities(blocks_data: dict, trans: dict):
+    expected = {
+        b["id"]: {"source_hash": b.get("source_hash"), "layout_uid": b.get("layout_uid")}
+        for p in blocks_data.get("pages", []) for b in p.get("blocks", [])
+    }
     mismatch = []
     unverified = 0
+    strict_v4 = int(blocks_data.get("schema_version", 0) or 0) >= 4
     for bid, value in (trans or {}).items():
         if not isinstance(value, dict):
             continue
         if not ((value.get("zh") or "").strip() or value.get("skip") or value.get("blank")):
             continue
-        want = expected.get(bid)
-        got = value.get("source_hash")
-        if want and got and want != got:
-            mismatch.append((bid, want, got))
-        elif want and not got:
-            unverified += 1
+        identity = expected.get(bid)
+        if identity is None:
+            mismatch.append((bid, "block_id", "present", "missing"))
+            continue
+        for field in ("source_hash", "layout_uid"):
+            want, got = identity.get(field), value.get(field)
+            if strict_v4 and not want:
+                unverified += 1
+            elif want and got and want != got:
+                mismatch.append((bid, field, want, got))
+            elif want and not got:
+                unverified += 1
     return mismatch, unverified
+
+
+# Backward-compatible import name for external callers.
+validate_translation_hashes = validate_translation_identities
 
 
 def main(argv=None) -> int:
@@ -353,6 +373,8 @@ def main(argv=None) -> int:
                          "即版面允许时自动放大、不够时自动缩小，两者兼顾")
     ap.add_argument("--no-indent", action="store_true",
                     help="关闭段落首行缩进（默认按中文排版习惯段首空两格）")
+    ap.add_argument("--allow-unverified-translations", action="store_true",
+                    help="允许缺少 source_hash/layout_uid 的旧手工译文（默认 v4 拒绝）")
     args = ap.parse_args(argv)
 
     try:
@@ -366,17 +388,26 @@ def main(argv=None) -> int:
     blocks_data = json.loads(Path(args.blocks).read_text(encoding="utf-8"))
     trans = json.loads(Path(args.translations).read_text(encoding="utf-8"))
 
-    hash_mismatch, hash_unverified = validate_translation_hashes(blocks_data, trans)
+    hash_mismatch, hash_unverified = validate_translation_identities(blocks_data, trans)
     if hash_mismatch:
-        print(f"❌ 发现 {len(hash_mismatch)} 条译文 source_hash 与当前 blocks.json 不一致；"
+        print(f"❌ 发现 {len(hash_mismatch)} 条译文身份与当前 blocks.json 不一致；"
               "这通常表示旧译文被错配到重新抽取后的 block。", file=sys.stderr)
-        for bid, want, got in hash_mismatch[:12]:
-            print(f"   {bid}: blocks={want[:12]}… translations={got[:12]}…", file=sys.stderr)
+        for bid, field, want, got in hash_mismatch[:12]:
+            print(f"   {bid} {field}: blocks={str(want)[:12]}… "
+                  f"translations={str(got)[:12]}…", file=sys.stderr)
         doc.close()
         return 2
     if hash_unverified:
-        print(f"⚠️ {hash_unverified} 条译文没有 source_hash（旧版/手工译文），"
-              "无法验证与当前文本块的来源一致性。")
+        strict_v4 = int(blocks_data.get("schema_version", 0) or 0) >= 4
+        if strict_v4 and not args.allow_unverified_translations:
+            print(f"❌ schema v4 有 {hash_unverified} 个译文身份字段缺失；默认拒绝构建。",
+                  file=sys.stderr)
+            print("   重新翻译并复制 source_hash/layout_uid；确需兼容旧手工译文时显式加 "
+                  "--allow-unverified-translations。", file=sys.stderr)
+            doc.close()
+            return 2
+        print(f"⚠️ {hash_unverified} 个译文身份字段缺失（旧版/手工译文），"
+              "已按显式兼容策略继续。")
 
     # 旋转页防护：未归一化的旋转页会导致 insert 坐标系错位（块矩形被裁空/叠印）
     rot_pages = [i + 1 for i in range(doc.page_count) if doc[i].rotation != 0]
@@ -513,7 +544,7 @@ def main(argv=None) -> int:
                         prev_tail = last_tail      # 阅读序上一块
                     else:
                         prev_tail = carry_tail     # 页首：沿用上一页末块句尾
-                    pref = indent_prefix(zh, prev_tail)
+                    pref = block_indent_prefix(b, zh, prev_tail)
                     if pref:
                         stats["indented"] = stats.get("indented", 0) + 1
                     final[id(b)] = pref + zh

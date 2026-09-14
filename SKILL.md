@@ -10,7 +10,7 @@ description: >-
   当用户要求「双栏对照翻译」「左英右中」「文献翻译成 PDF」「把这篇论文翻译成中文」、
   「双语对照 PDF」「LR_dual」「翻译论文并保留排版」「建文献库/术语库」时使用。
 license: MIT
-version: 1.5.0
+version: 1.5.1
 ---
 
 # 双栏对照文献翻译（左英文原文 / 右中文对照）
@@ -38,7 +38,7 @@ version: 1.5.0
    ```bash
    python scripts/pipeline.py --source "paper.pdf" --mode prepare --work-dir work
    ```
-   > 自动完成：旋转页归一化、**表格优先抽取（`tables.json` 硬隔离）**、**列感知自然段抽取（`extract_blocks.py v4`，自动区分 left/right/full 列、同列自然段回流、全宽障碍区切分与显式 `flow_index` 阅读序）**、bbox 嵌套簇审计。生成 `work/blocks.json`、`work/tables.json` 与 `work/manifest.json` 来源签名。
+   > 自动完成：旋转页归一化、**表格优先抽取（题注与表体硬隔离）**、**v4.1 列感知自然段抽取**（自动区分 left/right/full 列、拆分混栏原始块、识别跨栏图片/矢量图/表格 barrier、显式 `flow_index` 阅读序）、bbox 嵌套簇审计。生成 `work/blocks.json`、`work/tables.json` 与 `work/manifest.json` 来源签名。
    > **强烈推荐**：翻译前可运行 `python scripts/debug_flow.py --source paper.pdf --blocks work/blocks.json --pages 1-3 --out work/flow-overlay.pdf` 先行核对真实阅读序。
 
 2. **第二阶段：Agent 翻译生成 JSON**
@@ -70,16 +70,17 @@ python scripts/pipeline.py --source "paper.pdf" --mode auto --output "output/pap
 在模式 A 下，Agent 产出译文必须严格遵守以下规则：
 
 ### 1. 文本块处理原则与状态字段
-译文写在 `work/translations.json` 中。`blocks.json` 的每个块都带有稳定的 `source_hash`；
-Agent 产出条目时应把该值原样复制到译文条目中，例如：
+译文写在 `work/translations.json` 中。`blocks.json` 的每个块都带有 `source_hash`
+和版面敏感的 `layout_uid`；Agent 产出条目时应把二者原样复制到译文条目中，例如：
 ```json
 {
-  "p1b3": {"zh": "中文译文", "source_hash": "<复制 p1b3 的 source_hash>"},
-  "p1b4": {"skip": true, "source_hash": "<复制 p1b4 的 source_hash>"}
+  "p1b3": {"zh": "中文译文", "source_hash": "<复制 source_hash>", "layout_uid": "<复制 layout_uid>"},
+  "p1b4": {"skip": true, "source_hash": "<复制 source_hash>", "layout_uid": "<复制 layout_uid>"}
 }
 ```
-构建器会拒绝 `source_hash` 与当前 `blocks.json` 不一致的译文，防止重新抽取后 `p1bN`
-顺序变化造成旧译文静默错配。旧版无 hash 的手工译文仍可构建，但会明确告警。
+构建器会同时校验文本来源与版面身份，防止重新抽取后 `p1bN` 顺序变化、同页重复文本
+互换或 bbox 改变造成静默错配。schema v4 默认拒绝缺少身份字段的旧手工译文；确需兼容时
+显式传入 `--allow-unverified-translations`。
 
 状态字段含义：
 - **`zh`（翻译）**：标题、摘要、正文、章节标题、图表题注、算法伪代码说明、致谢。
@@ -94,7 +95,8 @@ Agent 产出条目时应把该值原样复制到译文条目中，例如：
 - **`flow_index`**：自然阅读顺序编号。翻译与构建均严格按此顺序串流，保证先读完左栏再读右栏（全宽大图表/标题前后重新分区）。
 - **`kind`**：语义类别（`body` / `heading` / `table` / `table_caption` / `figure_caption` / `math_only` / `meta`）。
 - **`column`**：分栏属性（`left` / `right` / `full`）。
-- **`continues_to_next` / `continues_from_prev`**：检测到跨页连续句子时标记。翻译相邻跨页条目时，必须紧密结合上下文保持主语、指代、时态和句法连贯。
+- **`continues_to_next` / `continues_from_prev`**：检测到跨页连续句子时标记；自动翻译会把标记传给模型，构建器也会据此禁止续段误缩进。
+- **`layout_uid`**：页码、列、量化 bbox 与源文本共同生成的版面身份；必须与 `source_hash` 一起复制。
 
 ### 2. 数学公式与符号排版规范
 - PDF 中提取出的行内特殊数学符号（如 $\mathcal{S}, \mathcal{A}, \mathcal{P}, \gamma$）可能缺失字体码位，redaction 会抹除它们；
@@ -128,7 +130,7 @@ Agent 产出条目时应把该值原样复制到译文条目中，例如：
 ```bash
 python scripts/debug_flow.py --source "paper.pdf" --blocks work/blocks.json --pages 1-3 --out work/flow-overlay.pdf
 ```
-> 每个文本框左上角标有 `flow_index kind column id`。重点核实正文流序是否沿着真实自然阅读顺序走（左栏自上而下 -> 右栏自上而下），且表格内容没有混入正文流。
+> 每个文本框左上角标有 `flow_index kind column id`；跨栏图片、矢量图和表格 barrier 以橙色虚线框显示。重点核实编号是否按“图上左栏 → 图上右栏 → 跨栏对象 → 图下左栏 → 图下右栏”推进，且表题和表体没有混流。
 
 ### 2. 构建后：排版与渲染视觉质检（render.py）
 纯文本提取无法查出文字遮挡图片、字体叠印或视口裁切。使用 `scripts/render.py` 生成可视化图像进行核查：

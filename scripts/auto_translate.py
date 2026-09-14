@@ -284,7 +284,7 @@ def load_prompt():
     return DEFAULT_PROMPT
 
 
-def build_messages(items, glossary, context=()):
+def build_messages(items, glossary, context=(), item_meta=None):
     sys_prompt = load_prompt()
     if glossary:
         g = "\n".join(f"- {s} → {t}" for s, t in glossary)
@@ -299,12 +299,20 @@ def build_messages(items, glossary, context=()):
             )
     sys_prompt += (
         "\n\n【连续性】输入条目按论文真实阅读顺序排列；相邻 id 可能是跨栏或跨页续句。"
+        "若条目带 continues_from_prev=true，它是上一页未结束自然段的后半段；"
+        "若带 continues_to_next=true，它的句意会在下一页继续。"
         "翻译当前 id 时必须结合前后相邻条目的语义，保持主语、指代、时态和句法连续，"
         "但仍按每个 id 分别返回译文，不得交换、合并或遗漏 id。"
         "\n\n【输出契约】只输出一个 JSON 对象：键=输入 id，值=对应中文译文。"
         "不要输出任何解释、寒暄或 Markdown 代码块标记。"
     )
-    user = json.dumps([{"id": i, "en": t} for i, t in items], ensure_ascii=False)
+    item_meta = item_meta or {}
+    payload = []
+    for block_id, source_text in items:
+        item = {"id": block_id, "en": source_text}
+        item.update(item_meta.get(block_id, {}))
+        payload.append(item)
+    user = json.dumps(payload, ensure_ascii=False)
     return [{"role": "system", "content": sys_prompt},
             {"role": "user", "content": user}]
 
@@ -324,7 +332,7 @@ def call_api(cfg, messages, timeout, temperature, retries=0):
     }
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "paper-dual-translate/1.4",
+        "User-Agent": "paper-dual-translate/1.5.1",
     }
     if cfg.get("key"):
         headers["Authorization"] = f"Bearer {cfg['key']}"
@@ -406,14 +414,14 @@ def _merge_usage(a, b):
     return out
 
 
-def do_batch(cfg, items, glossary, args, depth=0, context=()):
+def do_batch(cfg, items, glossary, args, depth=0, context=(), item_meta=None):
     """译一批；返回 ({id: zh}, usage)。失败重试，仍失败则二分降级。
     鉴权失败（401/403）不重试、不二分，直接向上抛。"""
     if not items:
         return {}, {}
     if getattr(args, "abort", None) is not None and args.abort.is_set():
         return {}, {}
-    messages = build_messages(items, glossary, context)
+    messages = build_messages(items, glossary, context, item_meta)
     err = ""
     for attempt in range(args.retry + 1):
         try:
@@ -429,7 +437,7 @@ def do_batch(cfg, items, glossary, args, depth=0, context=()):
                     translated_context = tuple(t for i, t in items if i in out)
                     rescued, rescued_usage = do_batch(
                         cfg, missing, glossary, args, depth + 1,
-                        tuple(context) + translated_context,
+                        tuple(context) + translated_context, item_meta,
                     )
                     return {**out, **rescued}, _merge_usage(usage, rescued_usage)
                 return out, usage
@@ -449,8 +457,12 @@ def do_batch(cfg, items, glossary, args, depth=0, context=()):
             time.sleep(min(8.0, 1.5 ** attempt))
     if len(items) > 1 and depth < args.split_depth:
         mid = len(items) // 2
-        a, ua = do_batch(cfg, items[:mid], glossary, args, depth + 1)
-        b, ub = do_batch(cfg, items[mid:], glossary, args, depth + 1)
+        left_context = tuple(context) + ("后文: " + items[mid][1],)
+        right_context = ("前文: " + items[mid - 1][1],) + tuple(context)
+        a, ua = do_batch(cfg, items[:mid], glossary, args, depth + 1,
+                         left_context, item_meta)
+        b, ub = do_batch(cfg, items[mid:], glossary, args, depth + 1,
+                         right_context, item_meta)
         return {**a, **b}, _merge_usage(ua, ub)
     print(f"  ⚠️ 批次失败（{len(items)} 块）: {err}")
     return {}, {}
@@ -468,6 +480,22 @@ def make_batches(items, budget):
         n += ln
     if cur:
         batches.append(cur)
+    return batches
+
+
+def make_flow_batches(items, budget, flow_pos):
+    """Batch only adjacent source-flow items; resume gaps start a new batch."""
+    batches, run = [], []
+    previous = None
+    for item in items:
+        position = flow_pos[item[0]]
+        if run and previous is not None and position != previous + 1:
+            batches.extend(make_batches(run, budget))
+            run = []
+        run.append(item)
+        previous = position
+    if run:
+        batches.extend(make_batches(run, budget))
     return batches
 
 
@@ -575,26 +603,34 @@ def resolve_api(args):
     return cfg
 
 
-def filter_resume_entries(existing: dict, block_hashes: dict[str, str | None]):
+def filter_resume_entries(existing: dict, block_identities: dict[str, dict]):
     valid = {}
-    stats = {"stale": 0, "legacy_invalidated": 0, "orphan": 0, "unverifiable": 0}
+    stats = {"stale": 0, "layout_stale": 0, "legacy_invalidated": 0,
+             "orphan": 0, "unverifiable": 0}
     for bid, value in (existing or {}).items():
         if not isinstance(value, dict):
             continue
-        if bid not in block_hashes:
+        if bid not in block_identities:
             stats["orphan"] += 1
             continue
-        current = block_hashes.get(bid)
-        old = value.get("source_hash")
-        if current:
-            if old == current:
-                valid[bid] = value
-            elif old:
-                stats["stale"] += 1
-            else:
-                stats["legacy_invalidated"] += 1
-        else:
+        current = block_identities[bid]
+        want_source, want_layout = current.get("source_hash"), current.get("layout_uid")
+        old_source, old_layout = value.get("source_hash"), value.get("layout_uid")
+        if want_source and want_layout:
+            if old_source != want_source:
+                if old_source:
+                    stats["stale"] += 1
+                else:
+                    stats["legacy_invalidated"] += 1
+                continue
+            if old_layout != want_layout:
+                if old_layout:
+                    stats["layout_stale"] += 1
+                else:
+                    stats["legacy_invalidated"] += 1
+                continue
             valid[bid] = value
+        else:
             stats["unverifiable"] += 1
     return valid, stats
 
@@ -636,7 +672,10 @@ def main(argv=None) -> int:
 
     data = json.loads(Path(args.blocks).read_text(encoding="utf-8"))
     pages = data.get("pages", [])
-    block_hashes = {b["id"]: b.get("source_hash") for p in pages for b in p.get("blocks", [])}
+    block_identities = {
+        b["id"]: {"source_hash": b.get("source_hash"), "layout_uid": b.get("layout_uid")}
+        for p in pages for b in p.get("blocks", [])
+    }
     total_pages = data.get("page_count") or (max((p.get("page", 0) for p in pages), default=0))
     want = parse_pages(args.pages, total_pages)
     skip_pages = set(parse_pages(args.skip_pages, total_pages)) if args.skip_pages else set()
@@ -653,20 +692,23 @@ def main(argv=None) -> int:
             existing = json.loads(out_path.read_text(encoding="utf-8"))
         except Exception:
             existing = {}
-    existing, resume_stats = filter_resume_entries(existing, block_hashes)
+    existing, resume_stats = filter_resume_entries(existing, block_identities)
     n0 = sum(1 for v in existing.values() if (v.get("zh") or "").strip())
     if n0:
         print(f"续跑: 可验证并复用已有译文 {n0} 条")
-    invalid = resume_stats["stale"] + resume_stats["legacy_invalidated"]
+    invalid = (resume_stats["stale"] + resume_stats["layout_stale"]
+               + resume_stats["legacy_invalidated"])
     if invalid:
         print(f"⚠️ 续跑安全校验淘汰 {invalid} 条旧记录："
-              f"hash不匹配 {resume_stats['stale']} / 无hash旧记录 {resume_stats['legacy_invalidated']}；"
+              f"文本hash不匹配 {resume_stats['stale']} / "
+              f"版面UID不匹配 {resume_stats['layout_stale']} / "
+              f"身份字段缺失 {resume_stats['legacy_invalidated']}；"
               "这些块将重新翻译")
     if resume_stats["orphan"]:
         print(f"ℹ️ 丢弃 {resume_stats['orphan']} 条已不在当前 blocks.json 中的孤儿译文")
     if resume_stats["unverifiable"]:
-        print(f"⚠️ 当前 blocks.json 有 {resume_stats['unverifiable']} 条旧块没有 source_hash，"
-              "对应 resume 记录只能按旧规则复用")
+        print(f"⚠️ 当前 blocks.json 有 {resume_stats['unverifiable']} 条块缺少完整身份字段，"
+              "对应 resume 记录不会复用")
 
     ctx = {
         "in_refs": False,
@@ -679,7 +721,7 @@ def main(argv=None) -> int:
         "counts": {},
     }
 
-    items, flow_items, skipped = [], [], {}
+    items, flow_items, item_meta, skipped = [], [], {}, {}
     for p in pages:
         pno = p.get("page")
         if want and pno not in want:
@@ -697,6 +739,13 @@ def main(argv=None) -> int:
                 ctx["counts"][why] = ctx["counts"].get(why, 0) + 1
                 continue
             flow_items.append((b["id"], b["text"]))
+            flags = {}
+            if b.get("continues_from_prev"):
+                flags["continues_from_prev"] = True
+            if b.get("continues_to_next"):
+                flags["continues_to_next"] = True
+            if flags:
+                item_meta[b["id"]] = flags
             if (existing.get(b["id"], {}) or {}).get("zh", "").strip():
                 continue
             items.append((b["id"], b["text"]))
@@ -705,8 +754,9 @@ def main(argv=None) -> int:
     if args.limit:
         items = items[:args.limit]
 
+    flow_pos = {bid: idx for idx, (bid, _) in enumerate(flow_items)}
     n_chars = sum(len(t) for _, t in items)
-    batches = make_batches(items, args.batch_chars)
+    batches = make_flow_batches(items, args.batch_chars, flow_pos)
     print(f"待译 {len(items)} 块 / {n_chars} 字符 -> {len(batches)} 批"
           f"（每批 ≤{args.batch_chars} 字符，并发 {args.workers}）")
     if skipped:
@@ -719,7 +769,8 @@ def main(argv=None) -> int:
             print(f"  批 {i}: {len(bt)} 块，首块 {bt[0][0]}「{head}…」")
         if len(batches) > 3:
             print(f"  …共 {len(batches)} 批")
-        msg = build_messages(batches[0], load_glossary(args.glossary)) if batches else []
+        msg = build_messages(batches[0], load_glossary(args.glossary),
+                             item_meta=item_meta) if batches else []
         if msg:
             print(f"\n[提示词预览] system 前 200 字：\n{msg[0]['content'][:200]}…")
             print(f"[提示词预览] user 前 200 字：\n{msg[1]['content'][:200]}…")
@@ -742,28 +793,26 @@ def main(argv=None) -> int:
     for i in skipped:
         if i not in result:
             result[i] = {"skip": True}
-            if block_hashes.get(i):
-                result[i]["source_hash"] = block_hashes[i]
+            result[i].update({k: v for k, v in block_identities.get(i, {}).items() if v})
     usage_total, failed = {}, []
     auth_err = ""
     lock = threading.Lock()
     done = 0
     t0 = time.time()
-    flow_pos = {bid: idx for idx, (bid, _) in enumerate(flow_items)}
-
     def batch_context(batch):
         first = flow_pos[batch[0][0]]
         last = flow_pos[batch[-1][0]]
         nearby = []
         if first > 0:
-            nearby.append(flow_items[first - 1][1])
+            nearby.append("前文: " + flow_items[first - 1][1])
         if last + 1 < len(flow_items):
-            nearby.append(flow_items[last + 1][1])
+            nearby.append("后文: " + flow_items[last + 1][1])
         return tuple(nearby)
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         futs = {
-            ex.submit(do_batch, cfg, bt, glossary, args, 0, batch_context(bt)): bt
+            ex.submit(do_batch, cfg, bt, glossary, args, 0,
+                      batch_context(bt), item_meta): bt
             for bt in batches
         }
         for fu in as_completed(futs):
@@ -780,8 +829,8 @@ def main(argv=None) -> int:
             with lock:
                 for k, v in got.items():
                     entry = {"zh": v}
-                    if block_hashes.get(k):
-                        entry["source_hash"] = block_hashes[k]
+                    entry.update({name: value for name, value
+                                  in block_identities.get(k, {}).items() if value})
                     result[k] = entry
                 for k, v in (usage or {}).items():
                     if isinstance(v, (int, float)):

@@ -38,14 +38,22 @@ def main(argv=None) -> int:
 
     src = fitz.open(Path(args.source).resolve())
     data = json.loads(Path(args.blocks).read_text(encoding="utf-8"))
-    by_page = {int(p["page"]): p.get("blocks", []) for p in data.get("pages", [])}
+    pages_data = {int(p["page"]): p for p in data.get("pages", [])}
     selected = parse_pages(args.pages, src.page_count)
 
     out = fitz.open()
     for pno in selected:
         out.insert_pdf(src, from_page=pno, to_page=pno)
         page = out[-1]
-        blocks = sorted(by_page.get(pno + 1, []), key=lambda b: b.get("flow_index", 10**9))
+        page_data = pages_data.get(pno + 1, {})
+        for index, barrier in enumerate(page_data.get("layout_barriers", [])):
+            r = fitz.Rect(barrier["bbox"])
+            color = (1.0, 0.45, 0.0)
+            page.draw_rect(r, color=color, width=1.2, dashes="[3 2]", overlay=True)
+            label = f"barrier {index} {barrier.get('kind', 'layout')}"
+            page.insert_text((r.x0, max(6, r.y0 - 2)), label,
+                             fontsize=6, color=color, overlay=True)
+        blocks = sorted(page_data.get("blocks", []), key=lambda b: b.get("flow_index", 10**9))
         for b in blocks:
             r = fitz.Rect(b["bbox"])
             col = b.get("column", "?")

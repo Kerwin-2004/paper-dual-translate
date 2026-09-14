@@ -61,6 +61,10 @@ class FlowV4Tests(unittest.TestCase):
         args = (bbox, 600, 800, False, "Times", False, [])
         self.assertEqual(M.classify_kind("Table 1. Results", *args), "table_caption")
         self.assertEqual(M.classify_kind("Fig. 2. Architecture", *args), "figure_caption")
+        self.assertEqual(
+            M.classify_kind("Table 1. Results", *args[:-1], [[30, 90, 570, 300]]),
+            "table_caption",
+        )
 
     def test_full_width_raw_block_is_split_by_physical_line_column(self):
         raw = {
@@ -76,6 +80,38 @@ class FlowV4Tests(unittest.TestCase):
         self.assertEqual([M.block_text(part) for part in parts], ["left", "right"])
         self.assertEqual([M.classify_column(part["bbox"], 600) for part in parts],
                          ["left", "right"])
+
+    def test_same_column_raw_lines_keep_indented_paragraphs_separate(self):
+        raw = {
+            "type": 0, "bbox": [40, 70, 560, 140],
+            "lines": [
+                {"bbox": [40, 70, 270, 82], "spans": [{"text": "First paragraph."}]},
+                {"bbox": [52, 85, 270, 97], "spans": [{"text": "Second paragraph."}]},
+                {"bbox": [330, 70, 560, 82], "spans": [{"text": "Right column."}]},
+            ],
+        }
+        parts = M.split_raw_block(raw, 600)
+        left = [part for part in parts if M.classify_column(part["bbox"], 600) == "left"]
+        self.assertEqual([M.block_text(part) for part in left],
+                         ["First paragraph.", "Second paragraph."])
+
+    def test_wide_layout_barrier_splits_reading_zones(self):
+        blocks = [
+            blk("left top", 80, 100),
+            blk("right top", 80, 100, x0=350, x1=550, column="right"),
+            blk("left bottom", 500, 520),
+            blk("right bottom", 500, 520, x0=350, x1=550, column="right"),
+        ]
+        out = M.assign_flow(
+            blocks, [{"kind": "image", "bbox": [80, 250, 520, 400]}], 600)
+        self.assertEqual([item["text"] for item in out],
+                         ["left top", "right top", "left bottom", "right bottom"])
+
+    def test_adjacent_vector_parts_form_one_wide_barrier(self):
+        clusters = M.cluster_object_rects([
+            [60, 200, 260, 300], [280, 200, 520, 300],
+        ])
+        self.assertEqual(clusters, [[60.0, 200.0, 520.0, 300.0]])
 
 
 if __name__ == "__main__":

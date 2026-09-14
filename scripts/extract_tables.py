@@ -95,19 +95,21 @@ def cluster_rules(rules, y_tol=30.0, x_overlap=0.5):
 
 
 def caption_lines(page):
-    """找出所有 "Table N" 题注行。"""
+    """找出所有 "Table N" 题注块，并保留多行题注的完整 bbox。"""
     caps = []
     for b in page.get_text("dict")["blocks"]:
         if b.get("type") != 0:
             continue
-        for ln in b.get("lines", []):
-            txt = clean("".join(s["text"] for s in ln.get("spans", [])))
-            m = re.match(r"Table\s+(\d+)\b", txt)
-            if m:
-                x0, y0, x1, y1 = ln["bbox"]
-                caps.append({"num": int(m.group(1)), "text": txt,
-                             "y": y0, "y1": y1, "x0": x0, "x1": x1,
-                             "xc": (x0 + x1) / 2})
+        lines = [clean("".join(s.get("text", "") for s in ln.get("spans", [])))
+                 for ln in b.get("lines", [])]
+        txt = clean(" ".join(line for line in lines if line))
+        m = re.match(r"Table\s+(\d+)\b", txt, re.I)
+        if m:
+            x0, y0, x1, y1 = b["bbox"]
+            caps.append({"num": int(m.group(1)), "text": txt,
+                         "y": y0, "y1": y1, "x0": x0, "x1": x1,
+                         "bbox": [x0, y0, x1, y1],
+                         "xc": (x0 + x1) / 2})
     return sorted(caps, key=lambda c: (c["y"], c["x0"]))
 
 
@@ -143,9 +145,10 @@ def group_by_caption(rules, caps, page_mid):
         g["x1"] = max(g["x1"], x1)
     for g in groups:
         g["ys"] = sorted(set(g["ys"]))
-        g["y0"] = g["cap"]["y"]
+        g["y0"] = min(g["ys"])
         g["y1"] = max(g["ys"])
         g["title"] = g["cap"]["text"]
+        g["caption_bbox"] = g["cap"]["bbox"]
     return sorted(groups, key=lambda g: (g["y0"], g["x0"]))
 
 
@@ -186,7 +189,7 @@ def main(argv=None) -> int:
     ap.add_argument("--pages", default="all")
     ap.add_argument("--gap-tol", type=float, default=6.0,
                     help="列间隙阈值(pt)。同一格内的词间距小于它，列与列之间大于它")
-    ap.add_argument("--include-caption", action="store_true", default=True)
+    ap.add_argument("--include-caption", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
     try:
@@ -221,13 +224,8 @@ def main(argv=None) -> int:
         for gi, g in enumerate(groups):
             x0, x1 = g["x0"], g["x1"]
             y_top, y_bot = g["y0"], g["y1"]
-            y_cap = g["cap"]["y"] if "cap" in g else y_top
-            # 题注可能比表体更宽/更左，把表域扩到能容下题注
-            if "cap" in g:
-                x0 = min(x0, g["cap"]["x0"])
-                x1 = max(x1, g["cap"]["x1"])
-
-            rows = line_rows(page, x0, x1, y_cap, y_bot + 2)
+            # 表题始终走独立题注通道；表格单元格仅从第一条表线开始抽取。
+            rows = line_rows(page, x0, x1, y_top, y_bot + 2)
             cells = []
             for ri, (cy, ws) in enumerate(rows):
                 for ci, cw in enumerate(split_cells(ws, args.gap_tol)):
@@ -247,7 +245,10 @@ def main(argv=None) -> int:
             if cells and (mode == "题注锚定" or len(cells) >= 4):
                 page_rec["tables"].append({
                     "index": gi,
-                    "region": [round(x0, 2), round(y_cap, 2), round(x1, 2), round(y_bot, 2)],
+                    "region": [round(x0, 2), round(y_top, 2), round(x1, 2), round(y_bot, 2)],
+                    "caption": ({"text": g["title"],
+                                 "bbox": [round(v, 2) for v in g["caption_bbox"]]}
+                                if "caption_bbox" in g else None),
                     "nrows": len(rows),
                     "cells": cells,
                 })

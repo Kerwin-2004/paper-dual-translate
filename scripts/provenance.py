@@ -28,6 +28,14 @@ def block_source_hash(page: int, text: str) -> str:
     return hashlib.sha256(payload).hexdigest()[:24]
 
 
+def block_layout_uid(page: int, column: str, bbox, text: str) -> str:
+    """Layout-sensitive identity for detecting same-text block swaps."""
+    normalized = _WS.sub(" ", (text or "").strip())
+    quantized = ",".join(f"{round(float(value) * 2) / 2:.1f}" for value in bbox)
+    payload = f"{int(page)}\0{column or '?'}\0{quantized}\0{normalized}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
 def file_record(path: str | Path) -> dict:
     p = Path(path).resolve()
     st = p.stat()
