@@ -1,6 +1,6 @@
 # paper-dual-translate
 
-把英文论文 PDF 译成 **左英文原文 / 右中文对照** 的双栏双语 PDF，图表、公式、表格、目录全部保留。
+把英文论文 PDF 译成 **左英文原文 / 右中文对照** 的双栏双语 PDF，并尽量保留图表、公式、表格与目录；无法安全保留或排版失败的页面会由质检显式报告。
 附带**文献知识库**与**术语对照知识库**，每翻译一篇就沉淀一次，越用越准。
 ---
 
@@ -9,7 +9,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| 双栏对照 PDF | 页宽 2 倍，左半是**原封不动的原文页**，右半是中文页；图表/公式/表格/书签全保留 |
+| 双栏对照 PDF | 页宽 2 倍，左半是**原封不动的原文页**，右半是中文页；优先保留图表/公式/表格/书签并运行质检 |
 | 表格翻译 | 按单元格替换，矢量网格不破坏（不是整块覆盖） |
 | 公式排版 | 行内公式按**数学斜体**渲染，与保留下来的显示公式风格一致；纯公式块原样不动 |
 | 文献知识库 | 自动登记题录、中译标题/摘要/关键词，产出可检索的索引 |
@@ -36,7 +36,7 @@
 2. 再在原块 bbox 内 `insert_textbox` / `insert_htmlbox` 写入中文，字号自适应；
 3. 最后新建**两倍宽**页面：左半 `show_pdf_page` 贴原页，右半贴改好的译页。
 
-所以"图和论文结构不变"是这套做法的**结构性保证**，不靠后期对齐或人工调版。
+因此图和论文结构通常可直接继承原页；最终结果仍以渲染验证和综合质检为准。
 
 ---
 
@@ -65,7 +65,7 @@ python scripts/pipeline.py --source paper.pdf --mode auto --output output/paper.
 
 #### Agent 直译协作（模式 A）
 ```bash
-# 步骤 1：一键预处理抽取（生成 work/blocks.json 与 work/tables.json）
+# 步骤 1：一键预处理抽取（另生成来源绑定 work/manifest.json）
 python scripts/pipeline.py --source paper.pdf --mode prepare --work-dir work
 
 # 步骤 2：Agent 产出 translations.json 与 table_trans.json 译文（见 Agent 契约）
@@ -87,8 +87,11 @@ python scripts/pipeline.py --source paper.pdf --mode build --work-dir work --out
 python scripts/normalize_pdf.py --check --input paper.pdf
 python scripts/normalize_pdf.py --input paper.pdf --output work/source_norm.pdf   # 仅当有旋转页
 
-python scripts/extract_blocks.py --input paper.pdf --output work/blocks.json --pages all
 python scripts/extract_tables.py --input paper.pdf --output work/tables.json --pages all
+python scripts/extract_blocks.py --input paper.pdf --output work/blocks.json --tables work/tables.json --pages all
+
+# 翻译前检查显式阅读序（标签为 flow_index / kind / column / id）
+python scripts/debug_flow.py --source paper.pdf --blocks work/blocks.json --pages 1-3 --out work/flow-overlay.pdf
 
 # bbox 嵌套簇审计：段落块包住行内公式碎片会导致误删公式/中文叠印，翻译前先修补
 python scripts/audit_nested_blocks.py --blocks work/blocks.json --apply --skeleton work/skeleton.json
@@ -103,15 +106,16 @@ python scripts/merge_paragraphs.py --blocks work/blocks.json --tables work/table
 
 ```json
 {
-  "p1b3":  {"zh": "DuSA：一种面向自动驾驶的 LLM 引导强化学习双环自学习框架"},
-  "p1b4":  {"skip": true},
-  "p7b10": {"blank": true}
+  "p1b3":  {"zh": "DuSA：一种面向自动驾驶的 LLM 引导强化学习双环自学习框架", "source_hash": "<复制原块哈希>"},
+  "p1b4":  {"skip": true, "source_hash": "<复制原块哈希>"},
+  "p7b10": {"blank": true, "source_hash": "<复制原块哈希>"}
 }
 ```
 
 - `zh` —— 该块的译文
 - `skip` —— 保留英文原样（页眉、DOI、作者、参考文献、纯公式块、表格所在块）
 - `blank` —— 只抹掉原文不写新字（用于把跨行片段并到相邻块时清残留）
+- `source_hash` —— 从对应 `blocks.json` 块原样复制；构建时用于拒绝错配的旧译文
 
 表格译文写成一个**词条字典**（同名单元格自动共用一条）：
 
@@ -266,8 +270,10 @@ paper-dual-translate/
 │   ├── pipeline.py                     一键式全自动 / 分步流水线调度器
 │   ├── config.py                       统一配置解析与环境自检（doctor）
 │   ├── normalize_pdf.py                旋转页检测与烘焙归一化
-│   ├── extract_blocks.py               源 PDF -> 段落级文本块
+│   ├── extract_blocks.py               源 PDF -> 列感知段落级文本块与显式阅读序
 │   ├── extract_tables.py               源 PDF -> booktabs 表格单元格拆解
+│   ├── debug_flow.py                   阅读序叠加 PDF（翻译前视觉检查）
+│   ├── provenance.py                   源文件、页码范围与块文本来源签名
 │   ├── audit_nested_blocks.py          bbox 嵌套簇审计/修补（公式碎片归簇）
 │   ├── merge_paragraphs.py             段落断句合并（几何与语义综合续接）
 │   ├── merge_translations.py           合并分页译文 trans_p*.json

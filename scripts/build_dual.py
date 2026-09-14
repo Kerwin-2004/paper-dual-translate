@@ -87,7 +87,8 @@ def _carry_from_page(blks: list, trans: dict, page_width: float) -> str | None:
             and not b.get("nested_in")]
     if not cand:
         return None
-    cand.sort(key=lambda b: (b["bbox"][0] > page_width / 2, b["bbox"][1], b["bbox"][0]))
+    cand.sort(key=lambda b: (b.get("flow_index", 10**9),
+                              b["bbox"][0] > page_width / 2, b["bbox"][1], b["bbox"][0]))
     tail: str | None = None
     ended_head = False
     for b in cand:
@@ -167,8 +168,8 @@ def cell_font_size(page, rect) -> float | None:
     for b in d.get("blocks", []):
         if b.get("type") != 0:
             continue
-        for l in b.get("lines", []):
-            for s in l.get("spans", []):
+        for line in b.get("lines", []):
+            for s in line.get("spans", []):
                 n = len(s.get("text", ""))
                 if n:
                     k = round(float(s.get("size", 0)), 1)
@@ -218,6 +219,17 @@ def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_CJK_OR_PUNCT = r"㐀-鿿，。；：！？、（）《》【】"
+
+
+def normalize_translation_text(text: str) -> str:
+    """构建前移除译文中的硬换行，让每个文本块按 bbox 自然回流。"""
+    t = re.sub(r"[ 	\r\n\f\v]+", " ", str(text or "")).strip()
+    t = re.sub(rf"(?<=[{_CJK_OR_PUNCT}]) +", "", t)
+    t = re.sub(rf" +(?=[{_CJK_OR_PUNCT}])", "", t)
+    return t
+
+
 def needs_fallback(text: str, base_font) -> bool:
     """基础字体盖不住的字符（数学字形等）需要走 html 渲染做字体回退。"""
     if base_font is None:
@@ -249,7 +261,6 @@ def insert_html_fitted(page, rect, text, arch, font_basename, math_basename,
     返回**实际渲染字号**：scale_low=0.8 允许 htmlbox 把内容整体缩到 0.8× 以塞进
     矩形，此时按 size × scale 汇报，字号统计与兜底判定才不失真。
     """
-    import fitz  # 本模块是惰性导入 fitz，函数内必须自己导一次
     body = mark_math(html_escape(text))
     size = float(start_size)
     while size >= MIN_FONT_SIZE:
@@ -296,6 +307,25 @@ def insert_fitted(page, rect, text, fontname, fontfile, color, start_size, align
     return None
 
 
+def validate_translation_hashes(blocks_data: dict, trans: dict):
+    expected = {b["id"]: b.get("source_hash")
+                for p in blocks_data.get("pages", []) for b in p.get("blocks", [])}
+    mismatch = []
+    unverified = 0
+    for bid, value in (trans or {}).items():
+        if not isinstance(value, dict):
+            continue
+        if not ((value.get("zh") or "").strip() or value.get("skip") or value.get("blank")):
+            continue
+        want = expected.get(bid)
+        got = value.get("source_hash")
+        if want and got and want != got:
+            mismatch.append((bid, want, got))
+        elif want and not got:
+            unverified += 1
+    return mismatch, unverified
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser("build_dual")
     ap.add_argument("--source", required=True, help="英文原文 PDF")
@@ -335,6 +365,18 @@ def main(argv=None) -> int:
     doc = fitz.open(src_path)
     blocks_data = json.loads(Path(args.blocks).read_text(encoding="utf-8"))
     trans = json.loads(Path(args.translations).read_text(encoding="utf-8"))
+
+    hash_mismatch, hash_unverified = validate_translation_hashes(blocks_data, trans)
+    if hash_mismatch:
+        print(f"❌ 发现 {len(hash_mismatch)} 条译文 source_hash 与当前 blocks.json 不一致；"
+              "这通常表示旧译文被错配到重新抽取后的 block。", file=sys.stderr)
+        for bid, want, got in hash_mismatch[:12]:
+            print(f"   {bid}: blocks={want[:12]}… translations={got[:12]}…", file=sys.stderr)
+        doc.close()
+        return 2
+    if hash_unverified:
+        print(f"⚠️ {hash_unverified} 条译文没有 source_hash（旧版/手工译文），"
+              "无法验证与当前文本块的来源一致性。")
 
     # 旋转页防护：未归一化的旋转页会导致 insert 坐标系错位（块矩形被裁空/叠印）
     rot_pages = [i + 1 for i in range(doc.page_count) if doc[i].rotation != 0]
@@ -438,15 +480,24 @@ def main(argv=None) -> int:
                 stats["skipped"] += 1
                 continue
             to_redact.append(fitz.Rect(b["bbox"]))
-            inserts.append((b, t["zh"].strip()))
+            zh_clean = normalize_translation_text(t["zh"])
+            if zh_clean != t["zh"].strip():
+                stats["normalized_breaks"] = stats.get("normalized_breaks", 0) + 1
+            inserts.append((b, zh_clean))
 
         # 首行缩进决策：按阅读序（列内自上而下、左列先于右列、上一页先于本页）
         # 回溯「上一个非标题已译块」的句尾。紧邻的前一块是标题 → 必是新段落（缩进）；
         # 前一块句未完（公式槽位/逗号结尾等）→ 段中接续（不缩）。
         if not args.no_indent and inserts:
-            ordered = sorted(inserts, key=lambda it: (it[0]["bbox"][0] > page.rect.width / 2,
-                                                      it[0]["bbox"][1],
-                                                      it[0]["bbox"][0]))
+            ordered = sorted(
+                inserts,
+                key=lambda it: (
+                    it[0].get("flow_index", 10**9),
+                    it[0]["bbox"][0] > page.rect.width / 2,
+                    it[0]["bbox"][1],
+                    it[0]["bbox"][0],
+                ),
+            )
             final: dict[int, str] = {}             # id(block) -> 最终 zh
             last_tail: str | None = None           # 本页最近一个非标题块的句尾
             prev_head = False                      # 上一处理块是否为标题
@@ -474,14 +525,18 @@ def main(argv=None) -> int:
 
         if to_redact:
             for r in to_redact:
-                page.add_redact_annot(r, fill=None)
+                page.add_redact_annot(r, fill=False)
             try:
                 page.apply_redactions(
                     graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                     images=fitz.PDF_REDACT_IMAGE_NONE,
                 )
             except TypeError:
-                page.apply_redactions()
+                print("❌ 当前 PyMuPDF 版本不支持安全 redaction 参数。请升级 PyMuPDF；"
+                      "为避免破坏图像/矢量线条，本次拒绝降级执行。", file=sys.stderr)
+                tmp.close()
+                doc.close()
+                return 2
 
         for b, zh in inserts:
             rect = fitz.Rect(b["bbox"])
@@ -544,7 +599,7 @@ def main(argv=None) -> int:
                 for t in tp["tables"]:
                     tw = max(1.0, t["region"][2] - t["region"][0])
                     for c in t["cells"]:
-                        zh = table_dict.get(c["text"])
+                        zh = normalize_translation_text(table_dict.get(c["text"]) or "")
                         if not zh:
                             continue
                         r = fitz.Rect(c["bbox"])
@@ -552,14 +607,18 @@ def main(argv=None) -> int:
                         cells.append((r, zh, tw, cell_font_size(page, r) or 7.0))
                 if cells:
                     for r, _, _, _ in cells:
-                        page.add_redact_annot(r, fill=None)
+                        page.add_redact_annot(r, fill=False)
                     try:
                         page.apply_redactions(
                             graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                             images=fitz.PDF_REDACT_IMAGE_NONE,
                         )
                     except TypeError:
-                        page.apply_redactions()
+                        print("❌ 当前 PyMuPDF 版本不支持安全 redaction 参数。请升级 PyMuPDF；"
+                              "为避免破坏图像/矢量线条，本次拒绝降级执行。", file=sys.stderr)
+                        tmp.close()
+                        doc.close()
+                        return 2
 
                     for r, zh, tw, sz in cells:
                         # 宽格（题注）左对齐，窄格居中
@@ -613,6 +672,8 @@ def main(argv=None) -> int:
         print(f"放大字号 {len(eg)} 处（前 15）: {eg[:15]}")
     if stats.get("indented"):
         print(f"首行缩进 {stats['indented']} 块（段首空两格）")
+    if stats.get("normalized_breaks"):
+        print(f"译文硬换行回流 {stats['normalized_breaks']} 块（按自然段重新排版）")
 
     # --- 3) 预览 ---
     if args.preview:

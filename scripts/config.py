@@ -115,7 +115,7 @@ def cfg() -> dict:
     return _CFG
 
 
-def _first(cands, explicit=None, env=None) -> Path | None:
+def _first(cands, explicit=None, env=None, configured=None) -> Path | None:
     if explicit:
         p = Path(explicit).expanduser()
         if p.is_file():
@@ -126,6 +126,10 @@ def _first(cands, explicit=None, env=None) -> Path | None:
             p = Path(v).expanduser()
             if p.is_file():
                 return p
+    if configured:
+        p = Path(configured).expanduser()
+        if p.is_file():
+            return p
     for c in cands:
         c = Path(c)
         if c.is_file():
@@ -194,13 +198,15 @@ def find_python(explicit=None) -> Path:
 
 
 def find_font(explicit=None, bold=False) -> Path | None:
+    c = cfg()
     if bold:
-        return _first(FONT_BOLD_CANDIDATES, explicit, "PDT_FONT_BOLD") or _first(FONT_CANDIDATES)
-    return _first(FONT_CANDIDATES, explicit, "PDT_FONT")
+        return (_first(FONT_BOLD_CANDIDATES, explicit, "PDT_FONT_BOLD", c.get("font_bold"))
+                or _first(FONT_CANDIDATES, configured=c.get("font")))
+    return _first(FONT_CANDIDATES, explicit, "PDT_FONT", c.get("font"))
 
 
 def find_math_font(explicit=None) -> Path | None:
-    return _first(MATH_FONT_CANDIDATES, explicit, "PDT_MATH_FONT")
+    return _first(MATH_FONT_CANDIDATES, explicit, "PDT_MATH_FONT", cfg().get("math_font"))
 
 
 def api_config(explicit_base=None, explicit_key=None,

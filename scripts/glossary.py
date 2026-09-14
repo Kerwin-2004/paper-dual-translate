@@ -80,7 +80,8 @@ def dedupe(rows, later_wins=True):
     """按 normalized source 去重；later_wins=True 时后出现的覆盖先出现的。"""
     order: list[str] = []
     table: dict[str, tuple[str, str, str]] = {}
-    norm = lambda s: re.sub(r"\s+", " ", s.strip().lower())
+    def norm(s):
+        return re.sub(r"\s+", " ", s.strip().lower())
     for src, tgt, lng in rows:
         k = norm(src)
         if k not in table:
@@ -124,7 +125,8 @@ def term_in_text(term: str, text: str) -> bool:
 def find_conflicts(rows) -> list[tuple[str, list[str]]]:
     """找出术语表内部自相矛盾的条目（同一源词给出多个不同译法）。"""
     table: dict[str, set] = {}
-    norm = lambda s: re.sub(r"\s+", " ", s.strip().lower())
+    def norm(s):
+        return re.sub(r"\s+", " ", s.strip().lower())
     for src, tgt, _ in rows:
         table.setdefault(norm(src), set()).add(tgt)
     return [(k, sorted(v)) for k, v in table.items() if len(v) > 1]

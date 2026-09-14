@@ -29,6 +29,7 @@ merge_paragraphs、auto_translate、build_dual、verify_render 与 qc_check。
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -44,20 +45,42 @@ SKILL_ROOT = SCRIPT_DIR.parent
 
 try:
     import config as PDT
+    import provenance as PROV
 except Exception:
     sys.path.insert(0, str(SCRIPT_DIR))
     import config as PDT
+    import provenance as PROV
 
 
-def run_step(py_exe: Path, script_name: str, args: list[str], desc: str) -> int:
+def _safe_cmd_for_log(cmd: list[str]) -> str:
+    out: list[str] = []
+    redact_next = False
+    for part in cmd:
+        s = str(part)
+        if redact_next:
+            out.append("***REDACTED***")
+            redact_next = False
+            continue
+        if s == "--api-key":
+            out.append(s)
+            redact_next = True
+        elif s.startswith("--api-key="):
+            out.append("--api-key=***REDACTED***")
+        else:
+            out.append(s)
+    return " ".join(out)
+
+
+def run_step(py_exe: Path, script_name: str, args: list[str], desc: str,
+             env: dict[str, str] | None = None) -> int:
     """运行子脚本并展示清晰的步骤进度。"""
     script_path = SCRIPT_DIR / script_name
     cmd = [str(py_exe), str(script_path)] + [str(a) for a in args]
     print(f"\n{'='*72}")
     print(f"▶ {desc}")
-    print(f"  命令: {' '.join(str(c) for c in cmd)}")
+    print(f"  命令: {_safe_cmd_for_log(cmd)}")
     print(f"{'='*72}")
-    res = subprocess.run(cmd)
+    res = subprocess.run(cmd, env=env)
     if res.returncode != 0:
         print(f"❌ 步骤失败 (退出码 {res.returncode}): {script_name}", file=sys.stderr)
     return res.returncode
@@ -136,6 +159,8 @@ def main(argv=None) -> int:
     tables_json = work_dir / "tables.json"
     translations_json = work_dir / "translations.json"
     table_trans_json = work_dir / "table_trans.json"
+    manifest_json = work_dir / "manifest.json"
+    incomplete_marker = work_dir / ".prepare-incomplete"
 
     print("=" * 72)
     print("paper-dual-translate · 流水线调度")
@@ -151,6 +176,28 @@ def main(argv=None) -> int:
         print("ℹ️ Dry-run 模式：仅规划流程，不执行具体命令。")
         return 0
 
+    manifest = None
+    if args.mode in ("build", "check"):
+        if incomplete_marker.is_file():
+            print("❌ 此 work-dir 的最近一次预处理未完成；拒绝复用可能混杂的新旧中间产物。",
+                  file=sys.stderr)
+            print("   请重新运行 --mode prepare，成功后该标记会自动清除。", file=sys.stderr)
+            return 2
+        ok, manifest, reason = PROV.validate_manifest(manifest_json, src_path)
+        if not ok:
+            print(f"❌ 工作目录与当前源 PDF 不匹配：{reason}", file=sys.stderr)
+            print("   请重新运行 --mode prepare，或改用与该 work-dir 对应的源 PDF。",
+                  file=sys.stderr)
+            return 2
+        if manifest is None:
+            print("⚠️ work-dir 没有 manifest.json（旧版工作目录），无法验证来源绑定。")
+        elif args.mode == "build" and not PROV.page_selection_covers(
+                manifest.get("pages", "all"), args.pages):
+            print(f"❌ 当前 work-dir 只预处理了页码 {manifest.get('pages')}，"
+                  f"不能构建请求的页码 {args.pages}。", file=sys.stderr)
+            print("   请用覆盖目标页码的 --pages 重新运行 --mode prepare。", file=sys.stderr)
+            return 2
+
     # ---------------- 模式 1: check 仅质检 ----------------
     if args.mode == "check":
         if not out_pdf.is_file():
@@ -158,8 +205,9 @@ def main(argv=None) -> int:
             return 2
         
         # verify_render
+        verify_rc = 0
         if blocks_json.is_file() and translations_json.is_file():
-            rc = run_step(
+            verify_rc = run_step(
                 py_exe, "verify_render.py",
                 ["--blocks", str(blocks_json), "--translations", str(translations_json),
                  "--translated", str(out_pdf)],
@@ -183,15 +231,20 @@ def main(argv=None) -> int:
         if args.ignore_pages:
             qc_args += ["--ignore-pages", str(args.ignore_pages)]
             
-        rc = run_step(py_exe, "qc_check.py", qc_args, "译文多维综合质检 (qc_check)")
-        return rc
+        qc_rc = run_step(py_exe, "qc_check.py", qc_args, "译文多维综合质检 (qc_check)")
+        return 1 if (verify_rc != 0 or qc_rc != 0) else 0
 
     # ---------------- 预处理步骤 (auto 与 prepare 均需要) ----------------
     if args.mode in ("auto", "prepare"):
+        incomplete_marker.write_text(
+            "prepare started; this marker is removed only after all extraction steps succeed\n",
+            encoding="utf-8",
+        )
         # Step 1: 旋转页检查与归一化
         chk_res = subprocess.run([str(py_exe), str(SCRIPT_DIR / "normalize_pdf.py"),
                                   "--check", "--input", str(src_path)],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace")
         effective_source = src_path
         if "检测到旋转页" in chk_res.stdout or "检测到旋转页" in chk_res.stderr:
             print("⚠️ 检测到源 PDF 包含旋转页面，执行自动烘焙归一化...")
@@ -204,18 +257,19 @@ def main(argv=None) -> int:
         else:
             print("✅ 源 PDF 无旋转页，无需归一化。")
 
-        # Step 2: 抽取文本块
-        ext_args = ["--input", str(effective_source), "--output", str(blocks_json),
-                    "--pages", args.pages]
-        rc = run_step(py_exe, "extract_blocks.py", ext_args, "文本块抽取 (extract_blocks)")
-        if rc != 0:
-            return rc
-
-        # Step 3: 抽取表格单元格
+        # Step 2: 先抽取表格。v4 文本提取必须知道表格区域，避免正文与表格串流。
         rc = run_step(py_exe, "extract_tables.py",
                       ["--input", str(effective_source), "--output", str(tables_json),
                        "--pages", args.pages],
                       "表格单元格抽取 (extract_tables)")
+        if rc != 0:
+            return rc
+
+        # Step 3: 列感知自然段抽取
+        ext_args = ["--input", str(effective_source), "--output", str(blocks_json),
+                    "--tables", str(tables_json), "--pages", args.pages]
+        rc = run_step(py_exe, "extract_blocks.py", ext_args,
+                      "列感知自然段抽取 (extract_blocks v4)")
         if rc != 0:
             return rc
 
@@ -239,6 +293,11 @@ def main(argv=None) -> int:
         if rc != 0:
             return rc
 
+        # 所有预处理步骤成功后才更新来源清单并解除失败保护。
+        manifest = PROV.write_manifest(manifest_json, src_path, effective_source, args.pages)
+        incomplete_marker.unlink(missing_ok=True)
+        print(f"来源清单   : {manifest_json}  sha256={manifest['source']['sha256'][:12]}…")
+
         if args.mode == "prepare":
             print("\n" + "=" * 72)
             print("🎉 预处理完成！可供 Agent 直译的数据已就绪：")
@@ -256,8 +315,10 @@ def main(argv=None) -> int:
         trans_args = ["--blocks", str(blocks_json), "--output", str(translations_json),
                       "--tables", str(tables_json), "--table-dict-out", str(table_trans_json),
                       "--workers", str(args.workers), "--batch-chars", str(args.batch_chars)]
+        child_env = None
         if args.api_key:
-            trans_args += ["--api-key", str(args.api_key)]
+            child_env = os.environ.copy()
+            child_env["PDT_API_KEY"] = str(args.api_key)
         if args.api_base:
             trans_args += ["--api-base", str(args.api_base)]
         if args.api_model:
@@ -268,7 +329,7 @@ def main(argv=None) -> int:
             trans_args += ["--pages", str(args.pages)]
 
         rc = run_step(py_exe, "auto_translate.py", trans_args,
-                      "LLM 批量翻译 (auto_translate)")
+                      "LLM 批量翻译 (auto_translate)", env=child_env)
         if rc != 0:
             return rc
 
@@ -288,8 +349,28 @@ def main(argv=None) -> int:
             print(f"❌ 缺少译文文件: {translations_json}", file=sys.stderr)
             return 2
 
-        # 确定构建源文件（若有归一化版本优先使用）
-        build_source = norm_pdf if norm_pdf.is_file() else src_path
+        # 只使用 manifest 明确绑定的 effective source，防止旧 .norm.pdf 被误用。
+        build_source = src_path
+        if manifest is not None:
+            eff_hash = (manifest.get("effective_source") or {}).get("sha256")
+            src_hash = (manifest.get("source") or {}).get("sha256")
+            if manifest.get("normalized"):
+                if not norm_pdf.is_file():
+                    print(f"❌ manifest 要求使用归一化 PDF，但文件不存在: {norm_pdf}", file=sys.stderr)
+                    return 2
+                if PROV.sha256_file(norm_pdf) != eff_hash:
+                    print("❌ 归一化 PDF 与 manifest 不匹配；拒绝使用可能过期的中间文件。",
+                          file=sys.stderr)
+                    return 2
+                build_source = norm_pdf
+            elif eff_hash != src_hash:
+                print("❌ manifest 的 effective_source 与 source 状态异常。", file=sys.stderr)
+                return 2
+            elif norm_pdf.is_file():
+                print(f"ℹ️ 忽略未绑定的旧归一化文件: {norm_pdf}")
+        elif norm_pdf.is_file():
+            print("⚠️ 旧 work-dir 无来源清单，暂按旧行为使用现有 .norm.pdf。")
+            build_source = norm_pdf
 
         build_args = [
             "--source", str(build_source),
@@ -313,10 +394,10 @@ def main(argv=None) -> int:
             return rc
 
         # 完整性验证
-        run_step(py_exe, "verify_render.py",
-                 ["--blocks", str(blocks_json), "--translations", str(translations_json),
-                  "--translated", str(out_pdf)],
-                 "逐块渲染完整性验证 (verify_render)")
+        verify_rc = run_step(py_exe, "verify_render.py",
+                             ["--blocks", str(blocks_json), "--translations", str(translations_json),
+                              "--translated", str(out_pdf)],
+                             "逐块渲染完整性验证 (verify_render)")
 
         # 质检
         qc_args = [
@@ -332,13 +413,13 @@ def main(argv=None) -> int:
         if args.ignore_pages:
             qc_args += ["--ignore-pages", str(args.ignore_pages)]
 
-        rc = run_step(py_exe, "qc_check.py", qc_args, "译文多维质检 (qc_check)")
+        qc_rc = run_step(py_exe, "qc_check.py", qc_args, "译文多维质检 (qc_check)")
 
         print("\n" + "=" * 72)
         print("🎉 任务完成！")
         print(f"成品 PDF : {out_pdf}")
         print("=" * 72)
-        return rc
+        return 1 if (verify_rc != 0 or qc_rc != 0) else 0
 
     return 0
 

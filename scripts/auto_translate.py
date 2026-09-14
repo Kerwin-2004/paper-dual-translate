@@ -224,7 +224,12 @@ def should_skip(b, page_no, page_rect, ctx):
         return True, "首页作者/题录"
     if b.get("nested_in"):
         return True, "簇内碎片"
-    if b.get("math_only"):
+    kind = b.get("kind")
+    if kind == "table":
+        return True, "表格区域"
+    if kind == "meta":
+        return True, "元数据"
+    if b.get("math_only") or kind == "math_only":
         return True, "纯公式块"
     if ctx.get("refs_auto", True):
         if ctx["in_refs"]:
@@ -279,14 +284,26 @@ def load_prompt():
     return DEFAULT_PROMPT
 
 
-def build_messages(items, glossary):
+def build_messages(items, glossary, context=()):
     sys_prompt = load_prompt()
     if glossary:
         g = "\n".join(f"- {s} → {t}" for s, t in glossary)
         sys_prompt += ("\n\n术语表（必须遵守，优先级高于你习惯的译法；"
                        "译文里要用这些中文词）：\n" + g)
-    sys_prompt += ("\n\n【输出契约】只输出一个 JSON 对象：键=输入 id，值=对应中文译文。"
-                   "不要输出任何解释、寒暄或 Markdown 代码块标记。")
+    if context:
+        context_text = "\n".join(f"- {text}" for text in context if text)
+        if context_text:
+            sys_prompt += (
+                "\n\n【批次边界上下文】下列相邻原文只用于理解衔接，不要为它们输出键：\n"
+                + context_text
+            )
+    sys_prompt += (
+        "\n\n【连续性】输入条目按论文真实阅读顺序排列；相邻 id 可能是跨栏或跨页续句。"
+        "翻译当前 id 时必须结合前后相邻条目的语义，保持主语、指代、时态和句法连续，"
+        "但仍按每个 id 分别返回译文，不得交换、合并或遗漏 id。"
+        "\n\n【输出契约】只输出一个 JSON 对象：键=输入 id，值=对应中文译文。"
+        "不要输出任何解释、寒暄或 Markdown 代码块标记。"
+    )
     user = json.dumps([{"id": i, "en": t} for i, t in items], ensure_ascii=False)
     return [{"role": "system", "content": sys_prompt},
             {"role": "user", "content": user}]
@@ -364,6 +381,23 @@ def extract_json(text):
     return out
 
 
+_CJK_OR_PUNCT = r"㐀-鿿，。；：！？、（）《》【】"
+
+
+def normalize_translation_text(text: str) -> str:
+    """把模型输出中的物理换行回流为一个自然段。
+
+    ASCII 单词之间保留一个空格；中文字符/标点周围去掉排版空白，因此
+    ``LLM
+与 RL`` 会成为 ``LLM与RL``，而 ``line one
+line two`` 仍保留词间空格。
+    """
+    t = re.sub(r"[ 	\r\n\f\v]+", " ", str(text or "")).strip()
+    t = re.sub(rf"(?<=[{_CJK_OR_PUNCT}]) +", "", t)
+    t = re.sub(rf" +(?=[{_CJK_OR_PUNCT}])", "", t)
+    return t
+
+
 def _merge_usage(a, b):
     out = dict(a)
     for k, v in (b or {}).items():
@@ -372,22 +406,32 @@ def _merge_usage(a, b):
     return out
 
 
-def do_batch(cfg, items, glossary, args, depth=0):
+def do_batch(cfg, items, glossary, args, depth=0, context=()):
     """译一批；返回 ({id: zh}, usage)。失败重试，仍失败则二分降级。
     鉴权失败（401/403）不重试、不二分，直接向上抛。"""
     if not items:
         return {}, {}
     if getattr(args, "abort", None) is not None and args.abort.is_set():
         return {}, {}
-    messages = build_messages(items, glossary)
+    messages = build_messages(items, glossary, context)
     err = ""
     for attempt in range(args.retry + 1):
         try:
             content, usage = call_api(cfg, messages, args.timeout, args.temperature)
             got = extract_json(content)
-            out = {i: got[i].strip() for i, _ in items
-                   if isinstance(got.get(i), str) and got[i].strip()}
+            out = {i: normalize_translation_text(got[i]) for i, _ in items
+                   if isinstance(got.get(i), str) and normalize_translation_text(got[i])}
             if out:
+                missing = [(i, t) for i, t in items if i not in out]
+                if not missing:
+                    return out, usage
+                if depth < args.split_depth:
+                    translated_context = tuple(t for i, t in items if i in out)
+                    rescued, rescued_usage = do_batch(
+                        cfg, missing, glossary, args, depth + 1,
+                        tuple(context) + translated_context,
+                    )
+                    return {**out, **rescued}, _merge_usage(usage, rescued_usage)
                 return out, usage
             err = "返回为空或不是合法 JSON"
         except ApiAuthError:
@@ -531,6 +575,30 @@ def resolve_api(args):
     return cfg
 
 
+def filter_resume_entries(existing: dict, block_hashes: dict[str, str | None]):
+    valid = {}
+    stats = {"stale": 0, "legacy_invalidated": 0, "orphan": 0, "unverifiable": 0}
+    for bid, value in (existing or {}).items():
+        if not isinstance(value, dict):
+            continue
+        if bid not in block_hashes:
+            stats["orphan"] += 1
+            continue
+        current = block_hashes.get(bid)
+        old = value.get("source_hash")
+        if current:
+            if old == current:
+                valid[bid] = value
+            elif old:
+                stats["stale"] += 1
+            else:
+                stats["legacy_invalidated"] += 1
+        else:
+            valid[bid] = value
+            stats["unverifiable"] += 1
+    return valid, stats
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main(argv=None) -> int:
@@ -568,6 +636,7 @@ def main(argv=None) -> int:
 
     data = json.loads(Path(args.blocks).read_text(encoding="utf-8"))
     pages = data.get("pages", [])
+    block_hashes = {b["id"]: b.get("source_hash") for p in pages for b in p.get("blocks", [])}
     total_pages = data.get("page_count") or (max((p.get("page", 0) for p in pages), default=0))
     want = parse_pages(args.pages, total_pages)
     skip_pages = set(parse_pages(args.skip_pages, total_pages)) if args.skip_pages else set()
@@ -582,10 +651,22 @@ def main(argv=None) -> int:
     if args.resume and out_path.is_file():
         try:
             existing = json.loads(out_path.read_text(encoding="utf-8"))
-            n0 = sum(1 for v in existing.values() if (v.get("zh") or "").strip())
-            print(f"续跑: 已有译文 {n0} 条（不会重译）")
         except Exception:
             existing = {}
+    existing, resume_stats = filter_resume_entries(existing, block_hashes)
+    n0 = sum(1 for v in existing.values() if (v.get("zh") or "").strip())
+    if n0:
+        print(f"续跑: 可验证并复用已有译文 {n0} 条")
+    invalid = resume_stats["stale"] + resume_stats["legacy_invalidated"]
+    if invalid:
+        print(f"⚠️ 续跑安全校验淘汰 {invalid} 条旧记录："
+              f"hash不匹配 {resume_stats['stale']} / 无hash旧记录 {resume_stats['legacy_invalidated']}；"
+              "这些块将重新翻译")
+    if resume_stats["orphan"]:
+        print(f"ℹ️ 丢弃 {resume_stats['orphan']} 条已不在当前 blocks.json 中的孤儿译文")
+    if resume_stats["unverifiable"]:
+        print(f"⚠️ 当前 blocks.json 有 {resume_stats['unverifiable']} 条旧块没有 source_hash，"
+              "对应 resume 记录只能按旧规则复用")
 
     ctx = {
         "in_refs": False,
@@ -598,14 +679,15 @@ def main(argv=None) -> int:
         "counts": {},
     }
 
-    items, skipped = [], {}
+    items, flow_items, skipped = [], [], {}
     for p in pages:
         pno = p.get("page")
         if want and pno not in want:
             continue
         rect = (0.0, float(p.get("height") or 0.0))
-        for b in p.get("blocks", []):
+        for b in sorted(p.get("blocks", []), key=lambda x: x.get("flow_index", 10**9)):
             b["_page"] = pno
+            b["text"] = re.sub(r"\s*\n\s*", " ", b.get("text", "")).strip()
             if args.no_skip:
                 sk, why = False, ""
             else:
@@ -614,6 +696,7 @@ def main(argv=None) -> int:
                 skipped[b["id"]] = why
                 ctx["counts"][why] = ctx["counts"].get(why, 0) + 1
                 continue
+            flow_items.append((b["id"], b["text"]))
             if (existing.get(b["id"], {}) or {}).get("zh", "").strip():
                 continue
             items.append((b["id"], b["text"]))
@@ -659,13 +742,30 @@ def main(argv=None) -> int:
     for i in skipped:
         if i not in result:
             result[i] = {"skip": True}
+            if block_hashes.get(i):
+                result[i]["source_hash"] = block_hashes[i]
     usage_total, failed = {}, []
     auth_err = ""
     lock = threading.Lock()
     done = 0
     t0 = time.time()
+    flow_pos = {bid: idx for idx, (bid, _) in enumerate(flow_items)}
+
+    def batch_context(batch):
+        first = flow_pos[batch[0][0]]
+        last = flow_pos[batch[-1][0]]
+        nearby = []
+        if first > 0:
+            nearby.append(flow_items[first - 1][1])
+        if last + 1 < len(flow_items):
+            nearby.append(flow_items[last + 1][1])
+        return tuple(nearby)
+
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-        futs = {ex.submit(do_batch, cfg, bt, glossary, args): bt for bt in batches}
+        futs = {
+            ex.submit(do_batch, cfg, bt, glossary, args, 0, batch_context(bt)): bt
+            for bt in batches
+        }
         for fu in as_completed(futs):
             bt = futs[fu]
             try:
@@ -678,7 +778,11 @@ def main(argv=None) -> int:
                     print("   请检查 --api-key / PDT_API_KEY / config.json 的 api_key 与 --api-base。")
                 continue
             with lock:
-                result.update({k: {"zh": v} for k, v in got.items()})
+                for k, v in got.items():
+                    entry = {"zh": v}
+                    if block_hashes.get(k):
+                        entry["source_hash"] = block_hashes[k]
+                    result[k] = entry
                 for k, v in (usage or {}).items():
                     if isinstance(v, (int, float)):
                         usage_total[k] = usage_total.get(k, 0) + v

@@ -229,9 +229,9 @@ def main(argv=None) -> int:
             mid = page.rect.width / 2
             left = page.get_text("text", clip=fitz.Rect(0, 0, mid, page.rect.height)) or ""
             right = page.get_text("text", clip=fitz.Rect(mid, 0, page.rect.width, page.rect.height)) or ""
-            lset = {nospace(l) for l in left.splitlines() if len(l.strip()) > 15}
-            for l in right.splitlines():
-                s = l.strip()
+            lset = {nospace(line) for line in left.splitlines() if len(line.strip()) > 15}
+            for line in right.splitlines():
+                s = line.strip()
                 if len(s) > 15 and ASCII_WORDY.match(s) and nospace(s) in lset:
                     untranslated.append((i + 1, s[:80]))
         if not untranslated:
@@ -256,7 +256,6 @@ def main(argv=None) -> int:
                 hay.append(page.get_text("text", clip=fitz.Rect(mid, 0, page.rect.width, page.rect.height)) or "")
             hay = "\n".join(hay)
             hay_ns = nospace(hay)
-            hay_low = nospace(hay).lower()
 
             # 只看"源词确实出现在已译块里"的术语，否则会被日期、期刊名等
             # 本就不该翻译的条目稀释（分母虚高、覆盖率虚低）
@@ -269,7 +268,7 @@ def main(argv=None) -> int:
                     if (tr2.get(b["id"]) or {}).get("zh")
                 )
                 src_buf = re.sub(r"\s+", " ", src_buf).lower()
-                rows_use = [(s, t, l) for s, t, l in rows if s.lower() in src_buf]
+                rows_use = [(s, t, lang) for s, t, lang in rows if s.lower() in src_buf]
 
             hit = [(s, t) for s, t, _ in rows_use if t and nospace(t) in hay_ns]
             miss = [(s, t) for s, t, _ in rows_use if not (t and nospace(t) in hay_ns)]
@@ -361,7 +360,7 @@ def main(argv=None) -> int:
 
     if args.json:
         print(json.dumps(RESULTS, ensure_ascii=False, indent=2))
-        return 0
+        return 1 if any(r["level"] == "FAIL" for r in RESULTS) else 0
 
     icon = {"PASS": "✅", "WARN": "⚠️ ", "FAIL": "❌", "INFO": "ℹ️ "}
     print("=" * 72)

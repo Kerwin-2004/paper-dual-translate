@@ -32,14 +32,22 @@ import re
 import sys
 from pathlib import Path
 
+import provenance as PROV
+
 try:  # Windows 传统控制台/管道下固定 UTF-8，避免打印中文与 ✅⚠️ 时 UnicodeEncodeError
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
-TERMINAL = tuple(".!?;:")  # 英文句末标点（含冒号引出列表的情形不合并）
-LOWER_START = re.compile(r"^[a-z]")
+TERMINAL = tuple(".!?;:")
+# 强结构边界：列表、参考文献、图表/公式题注不与上一正文块合并。
+_STRUCT_START = re.compile(
+    r"^\s*(?:"
+    r"\[\d{1,4}\]|\(\d{1,4}\)|\d{1,3}[.)]\s+|"
+    r"[-•·▪–]\s+|"
+    r"(?:fig(?:ure)?|table|algorithm|eq(?:uation)?)\.?\s*\d+\b"
+    r")", re.I)
 
 
 def same_column(a: dict, b: dict) -> bool:
@@ -49,7 +57,13 @@ def same_column(a: dict, b: dict) -> bool:
 
 
 def continuable(a: dict, b: dict, min_ratio: float) -> bool:
-    """几何 + 文本续句信号综合判定 a、b 是同一段落被切碎的两半。"""
+    """以几何连续性为主判断两个块是否属于同一自然段。
+
+    PDF 抽取器经常因为字体切换、引用、句号或内部对象边界把一个自然段拆成多个
+    block。不能用“上一块是否句号结尾 / 下一块是否大写”作为硬段落边界，否则
+    中文会在每个英文句子后被强制换段。真正的段落边界主要由垂直间距、列位置、
+    标题/公式/表格和列表等结构信号决定。
+    """
     if a.get("heading") or b.get("heading") or a.get("bold") or b.get("bold"):
         return False
     if a.get("math_only") or b.get("math_only"):
@@ -64,13 +78,15 @@ def continuable(a: dict, b: dict, min_ratio: float) -> bool:
     sz = min(a["size"], b["size"])
     if gap > min_ratio * sz:
         return False
-    ta = a["text"].rstrip()
-    tb = b["text"].lstrip()
-    if not ta.endswith(TERMINAL):
-        return True          # 上半句没写完 → 必然续段
-    if LOWER_START.match(tb):
-        return True          # 下一块小写开头 → 是句中接续
-    return False             # 两者皆无 → 新段落起始
+    tb = (b.get("text") or "").lstrip()
+    if _STRUCT_START.match(tb):
+        return False
+    # 句号 + 明显右缩进通常是真正的新段落；普通同 x0 的下一句仍继续合并。
+    ta = (a.get("text") or "").rstrip()
+    indent_delta = b["bbox"][0] - a["bbox"][0]
+    if ta.endswith(TERMINAL) and indent_delta > max(4.0, 0.75 * sz):
+        return False
+    return True
 
 
 def main(argv=None) -> int:
@@ -87,6 +103,9 @@ def main(argv=None) -> int:
 
     f = Path(args.blocks).resolve()
     data = json.loads(f.read_text(encoding="utf-8"))
+    if int(data.get("schema_version", 0) or 0) >= 4:
+        print("ℹ️ blocks.json 为 v4 列感知自然段格式：跳过二次段落合并，避免重新串流。")
+        return 0
     trans = {}
     if args.translations and Path(args.translations).is_file():
         trans = json.loads(Path(args.translations).read_text(encoding="utf-8"))
@@ -180,6 +199,8 @@ def main(argv=None) -> int:
     # 写回：从 blocks 列表里移除被合并的成员（head 保留、已更新 bbox/text）
     for p in data.get("pages", []):
         p["blocks"] = [x for x in p["blocks"] if x["id"] not in drop_ids]
+        for b in p["blocks"]:
+            b["source_hash"] = PROV.block_source_hash(p["page"], b.get("text") or "")
     f.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"\n已写回 {f}: 合并 {n_merge} 组、移除 {len(drop_ids)} 个成员块")
     print("提醒: 翻译时 head 块的 zh 要覆盖整段内容；被合并块如已有译文请删除其条目。")

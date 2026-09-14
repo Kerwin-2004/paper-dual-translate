@@ -2,19 +2,20 @@
 name: paper-dual-translate
 description: >-
   把英文学术论文 PDF 翻译成「左英文原文 / 右中文对照」的双栏双语 PDF，
-  100% 完整保留原版矢量插图、三线表格、行内与行间公式及论文版式排版。
+  尽量完整保留原版矢量插图、三线表格、行内与行间公式及论文版式排版，
+  并通过渲染与质检步骤暴露无法安全保留或排版失败的页面。
   支持两种模式：Agent 直译（模式 A，使用当前 Agent 自身模型，0 外部 API 费用）与
   脚本批量翻译（模式 B，直调 LLM API 无人值守全自动）。
   内置一键式流水线调度（pipeline.py）、视觉质检与跨文献术语自精进知识库。
   当用户要求「双栏对照翻译」「左英右中」「文献翻译成 PDF」「把这篇论文翻译成中文」、
   「双语对照 PDF」「LR_dual」「翻译论文并保留排版」「建文献库/术语库」时使用。
 license: MIT
-version: 1.4.1
+version: 1.5.0
 ---
 
 # 双栏对照文献翻译（左英文原文 / 右中文对照）
 
-产出等价于 `*.no_watermark.zh-CN.LR_dual.pdf` 的高质量成果：页面宽度翻倍，**左半是原封不动的英文原页，右半是中文译页**，图表、公式、表格与排版结构完美保留。
+产出 `*.no_watermark.zh-CN.LR_dual.pdf` 双栏成果：页面宽度翻倍，**左半是原封不动的英文原页，右半是中文译页**；右页优先保留原有图表、公式、表格与排版结构，并用渲染和质检结果明确标出例外。
 
 ## 两种工作模式
 
@@ -33,12 +34,12 @@ version: 1.4.1
 
 ### 模式 A：Agent 直译（两阶段工作流）
 
-1. **第一阶段：一键预处理抽取**
+1. **第一阶段：一键预处理抽取（v4 列感知自然段模型）**
    ```bash
    python scripts/pipeline.py --source "paper.pdf" --mode prepare --work-dir work
    ```
-   > 自动完成：旋转页归一化、段落文本块与表格抽取、bbox 嵌套簇审计修复、段落断句合并。生成 `work/blocks.json` 与 `work/tables.json`。
-   > 该步骤可安全重跑：检测到已有 `work/translations.json` 时，合并会跳过含已译成员的段落（不会吃掉译文）。
+   > 自动完成：旋转页归一化、**表格优先抽取（`tables.json` 硬隔离）**、**列感知自然段抽取（`extract_blocks.py v4`，自动区分 left/right/full 列、同列自然段回流、全宽障碍区切分与显式 `flow_index` 阅读序）**、bbox 嵌套簇审计。生成 `work/blocks.json`、`work/tables.json` 与 `work/manifest.json` 来源签名。
+   > **强烈推荐**：翻译前可运行 `python scripts/debug_flow.py --source paper.pdf --blocks work/blocks.json --pages 1-3 --out work/flow-overlay.pdf` 先行核对真实阅读序。
 
 2. **第二阶段：Agent 翻译生成 JSON**
    - 读 `work/blocks.json`，按下方 [Agent 翻译契约](#agent-翻译硬约束与输出契约) 生成 `work/translations.json`（可按页拆分为 `trans_p1_2.json` 等多文件）；
@@ -69,14 +70,31 @@ python scripts/pipeline.py --source "paper.pdf" --mode auto --output "output/pap
 在模式 A 下，Agent 产出译文必须严格遵守以下规则：
 
 ### 1. 文本块处理原则与状态字段
-译文写在 `work/translations.json` 中，结构为 `{block_id: {"zh": "..."} | {"skip": true} | {"blank": true}}`：
+译文写在 `work/translations.json` 中。`blocks.json` 的每个块都带有稳定的 `source_hash`；
+Agent 产出条目时应把该值原样复制到译文条目中，例如：
+```json
+{
+  "p1b3": {"zh": "中文译文", "source_hash": "<复制 p1b3 的 source_hash>"},
+  "p1b4": {"skip": true, "source_hash": "<复制 p1b4 的 source_hash>"}
+}
+```
+构建器会拒绝 `source_hash` 与当前 `blocks.json` 不一致的译文，防止重新抽取后 `p1bN`
+顺序变化造成旧译文静默错配。旧版无 hash 的手工译文仍可构建，但会明确告警。
+
+状态字段含义：
 - **`zh`（翻译）**：标题、摘要、正文、章节标题、图表题注、算法伪代码说明、致谢。
 - **`skip: true`（跳过，右半保留原英文）**：
   - 页眉页脚、页码、DOI、刊名、投稿/接收日期、版权行、作者姓名/单位/邮箱/脚注；
   - **参考文献整页**（必须跳过）；
-  - **纯公式块（`math_only=True`）**（跳过才能 100% 保留原始 Math 字体字形）；
-  - **表格所在的文本块**（表格走独立通道，避免整块替换破坏矢量网格）。
+  - **纯公式块（`math_only=True` 或 `kind="math_only"`）**（跳过才能 100% 保留原始 Math 字体字形）；
+  - **表格所在的文本块（`kind="table"`）**（表格走独立通道，避免整块替换破坏矢量网格）。
 - **`blank: true`（清空）**：仅抹除原文，不写入新字（用于跨行碎片并入主块后的残留清理）。
+
+**v4 列感知与流序关键字段（`blocks.json`）**：
+- **`flow_index`**：自然阅读顺序编号。翻译与构建均严格按此顺序串流，保证先读完左栏再读右栏（全宽大图表/标题前后重新分区）。
+- **`kind`**：语义类别（`body` / `heading` / `table` / `table_caption` / `figure_caption` / `math_only` / `meta`）。
+- **`column`**：分栏属性（`left` / `right` / `full`）。
+- **`continues_to_next` / `continues_from_prev`**：检测到跨页连续句子时标记。翻译相邻跨页条目时，必须紧密结合上下文保持主语、指代、时态和句法连贯。
 
 ### 2. 数学公式与符号排版规范
 - PDF 中提取出的行内特殊数学符号（如 $\mathcal{S}, \mathcal{A}, \mathcal{P}, \gamma$）可能缺失字体码位，redaction 会抹除它们；
@@ -97,13 +115,22 @@ python scripts/pipeline.py --source "paper.pdf" --mode auto --output "output/pap
 同名单元格自动复用，构建引擎自动计算单格原有字号并原位居中/靠左替换，保留所有矢量边框。
 
 ### 4. 段落排版与换行格式
-- **译文中严禁插入手动换行符 (`\n`)**：所有换行由排版引擎根据原段落 bbox 宽度自动计算；
+- **译文中严禁插入手动换行符 (`\n`)**：所有换行由排版引擎根据自然段 bbox 宽度自动计算；构建器会兜底清除误产生的硬换行。
+- **段落合并以版面几何为主**：同列、同行距连续的碎片即使前一块以句号结束、下一块以大写字母开头，也会先合并为一个自然段再翻译/排版；列表、参考文献、题注等结构边界仍保持独立。
 - **首行缩进**：默认自动执行中文排版标准（段首空两格全角空格 `\u3000\u3000`）。标题后首块必缩进；断句接续块（逗号结尾/公式槽位跨段）不缩进。
 
 ---
 
 ## 视觉质检（具备视觉能力的 Agent 必做）
 
+### 1. 翻译前：流序可视化检查（推荐，debug_flow）
+在预处理完成后、启动翻译前，快速生成阅读流序可视化 PDF，彻底将“版面抽取错序”与“翻译问题”解耦：
+```bash
+python scripts/debug_flow.py --source "paper.pdf" --blocks work/blocks.json --pages 1-3 --out work/flow-overlay.pdf
+```
+> 每个文本框左上角标有 `flow_index kind column id`。重点核实正文流序是否沿着真实自然阅读顺序走（左栏自上而下 -> 右栏自上而下），且表格内容没有混入正文流。
+
+### 2. 构建后：排版与渲染视觉质检（render.py）
 纯文本提取无法查出文字遮挡图片、字体叠印或视口裁切。使用 `scripts/render.py` 生成可视化图像进行核查：
 
 ```bash
