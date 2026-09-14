@@ -1,0 +1,22 @@
+{
+  "_comment": "把这个文件复制成 config.json 并按需修改。config.json 是本机私有的：不要随技能分发、不要提交到公开仓库。所有字段都可省略——省略就走环境变量/默认值。优先级：命令行参数 > 环境变量 > config.json。",
+  "_env_example": {
+    "PDT_API_KEY": "sk-xxxx",
+    "PDT_API_BASE": "https://api.deepseek.com/v1",
+    "PDT_API_MODEL": "deepseek-chat",
+    "PDT_KB_DIR": "~/research/kb",
+    "PDT_WORK_DIR": "~/research/work"
+  },
+
+  "api_base": "https://api.deepseek.com/v1",
+  "api_key": "",
+  "api_model": "deepseek-chat",
+
+  "python": "",
+  "font": "",
+  "font_bold": "",
+  "math_font": "",
+
+  "kb_dir": "",
+  "work_dir": ""
+}
