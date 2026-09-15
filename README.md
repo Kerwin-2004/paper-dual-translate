@@ -123,6 +123,8 @@ python scripts/merge_paragraphs.py --blocks work/blocks.json --tables work/table
 身份字段在全部预处理修改完成后统一刷新；构建器会根据当前文本和最终 bbox 现场重算，
 不会信任 `blocks.json` 中可能过期的缓存值。自动翻译按包含跳过块的完整 `flow_index`
 判断相邻关系，并在标题、题注、表格、公式和跨栏对象边界处断批。
+嵌套公式或文本碎片保存在外层块的 `inline_fragments` 中；自动翻译使用成对 marker
+验证响应，并在写入译文前恢复不可变的数学片段，避免扩大 bbox 后静默丢失内容。
 
 schema v4 默认要求两个身份字段齐全。确实需要构建旧手工译文时，可显式增加
 `--allow-unverified-translations`；重新抽取后应优先新建 work 目录并重新翻译。

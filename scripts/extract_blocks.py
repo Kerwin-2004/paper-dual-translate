@@ -258,11 +258,19 @@ def split_raw_block(block: dict, page_w: float) -> list[dict]:
     return sorted(fragments, key=lambda fragment: (fragment["bbox"][1], fragment["bbox"][0]))
 
 
-def split_at_horizontal_boundaries(block: dict, boundaries: list[float]) -> list[dict]:
-    """Split physical lines at table edges before caption/table classification."""
+def split_at_table_boundaries(block: dict, table_regions: list[list[float]],
+                              min_x_overlap=0.25) -> list[dict]:
+    """Split at table edges only when the fragment overlaps that table in x."""
     lines = [line for line in block.get("lines", []) if line.get("bbox")]
-    cuts = sorted(float(value) for value in boundaries
-                  if float(block["bbox"][1]) < float(value) < float(block["bbox"][3]))
+    bx0, by0, bx1, by1 = [float(value) for value in block["bbox"]]
+    cuts = []
+    for rx0, ry0, rx1, ry1 in table_regions:
+        overlap = max(0.0, min(bx1, rx1) - max(bx0, rx0))
+        ratio = overlap / max(1e-6, min(bx1 - bx0, rx1 - rx0))
+        if ratio < min_x_overlap:
+            continue
+        cuts.extend(edge for edge in (float(ry0), float(ry1)) if by0 < edge < by1)
+    cuts = sorted(set(cuts))
     if len(lines) < 2 or not cuts:
         return [block]
     groups: dict[int, list[dict]] = {}
@@ -488,6 +496,11 @@ def assign_flow(blocks: list[dict], layout_barriers: list[dict], page_w: float) 
 
 
 def mark_page_continuations(pages):
+    for page in pages:
+        for block in page.get("blocks", []):
+            block.pop("continues_to_next", None)
+            block.pop("continues_from_prev", None)
+
     def substantive(page):
         return [
             block for block in sorted(
@@ -504,6 +517,18 @@ def mark_page_continuations(pages):
             continue
         last, first = left[-1], right[0]
         if last.get("kind") != "body" or first.get("kind") != "body":
+            continue
+        if first.get("flow_break"):
+            continue
+        last_bottom = float(last.get("bbox", (0, 0, 0, 0))[3])
+        first_top = float(first.get("bbox", (0, 0, 0, 0))[1])
+        barrier_after_last = any(
+            float(item.get("bbox", (0, 0, 0, 0))[1]) >= last_bottom - 1
+            for item in pages[i].get("layout_barriers", []))
+        barrier_before_first = any(
+            float(item.get("bbox", (0, 0, 0, 0))[3]) <= first_top + 1
+            for item in pages[i + 1].get("layout_barriers", []))
+        if barrier_after_last or barrier_before_first:
             continue
         lt, ft = last["text"].rstrip(), first["text"].lstrip()
         if (lt and not lt.endswith(TERMINAL)) or LOWER_START.match(ft):
@@ -548,10 +573,9 @@ def main(argv=None) -> int:
             if source_block.get("type") != 0:
                 continue
             fragments = []
-            boundaries = [edge for region in table_map.get(page_no, [])
-                          for edge in (region[1], region[3])]
             for column_fragment in split_raw_block(source_block, page.rect.width):
-                fragments.extend(split_at_horizontal_boundaries(column_fragment, boundaries))
+                fragments.extend(split_at_table_boundaries(
+                    column_fragment, table_map.get(page_no, [])))
             for fragment_index, rb in enumerate(fragments):
                 text = block_text(rb)
                 if len(text) < args.min_chars:

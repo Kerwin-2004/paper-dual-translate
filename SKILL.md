@@ -95,6 +95,7 @@ python scripts/pipeline.py --source "paper.pdf" --mode auto --output "output/pap
 - **`column`**：分栏属性（`left` / `right` / `full`）。
 - **`continues_to_next` / `continues_from_prev`**：检测到跨页连续句子时标记；自动翻译会把标记传给模型，构建器也会据此禁止续段误缩进。
 - **`flow_break`**：标题、题注、表格、公式或跨栏对象形成的语义边界；自动翻译不得跨边界组批。
+- **`inline_fragments`**：嵌套公式或碎片会随外层块进入翻译；自动模式用成对 marker 校验并恢复数学原文，不得手工删除。
 - **`layout_uid`**：全部预处理完成后，由页码、列、最终 bbox 与源文本生成；构建时会现场重算，必须与 `source_hash` 一起复制。
 
 ### 2. 数学公式与符号排版规范

@@ -172,31 +172,34 @@ def caption_lines(page, rules):
 
 
 def group_by_caption(rules, caps, page_mid, max_caption_gap=80.0):
-    """Cluster rules into candidate tables, then match each cluster to a nearby caption."""
+    """Assign rules to caption ownership windows before clustering tables."""
     groups = []
-    candidates = cluster_rules(rules, y_tol=72.0, x_overlap=0.5)
-    for candidate in candidates:
-        if len(candidate["ys"]) < 2:
-            continue
-        y, x0, x1 = candidate["y0"], candidate["x0"], candidate["x1"]
+    owned: dict[int, list[tuple[float, float, float]]] = {
+        index: [] for index in range(len(caps))}
+    for y, x0, x1 in rules:
         xc = (x0 + x1) / 2
-        cands = [c for c in caps
-                 if c["y1"] <= y + 2
-                 and 0 <= y - c["y1"] <= max_caption_gap
-                 and (_overlap(x0, x1, c["x0"], c["x1"]) >= 0.2
-                      or (c["xc"] < page_mid) == (xc < page_mid))]
+        cands = [(index, cap) for index, cap in enumerate(caps)
+                 if cap["y1"] <= y + 2
+                 and (_overlap(x0, x1, cap["x0"], cap["x1"]) >= 0.2
+                      or (cap["xc"] < page_mid) == (xc < page_mid))]
         if not cands:
             continue
-        best_dy = min(y - c["y1"] for c in cands)
-        tied = [c for c in cands if (y - c["y1"]) <= best_dy + 8]
-        if len(tied) == 1:
-            best = tied[0]
-        else:
-            same_side = [c for c in tied if (c["xc"] < page_mid) == (xc < page_mid)]
-            pool = same_side or tied
-            best = min(pool, key=lambda c: abs(xc - c["xc"]))
-        groups.append({"cap": best, "ys": list(candidate["ys"]),
-                       "x0": x0, "x1": x1})
+        latest_y = max(cap["y"] for _, cap in cands)
+        tied = [(index, cap) for index, cap in cands if cap["y"] >= latest_y - 8]
+        same_side = [(index, cap) for index, cap in tied
+                     if (cap["xc"] < page_mid) == (xc < page_mid)]
+        index, _ = min(same_side or tied, key=lambda item: abs(xc - item[1]["xc"]))
+        owned[index].append((y, x0, x1))
+
+    for index, cap_rules in owned.items():
+        cap = caps[index]
+        for candidate in cluster_rules(cap_rules, y_tol=72.0, x_overlap=0.5):
+            if len(candidate["ys"]) < 2:
+                continue
+            if not 0 <= candidate["y0"] - cap["y1"] <= max_caption_gap:
+                continue
+            groups.append({"cap": cap, "ys": list(candidate["ys"]),
+                           "x0": candidate["x0"], "x1": candidate["x1"]})
     for g in groups:
         g["ys"] = sorted(set(g["ys"]))
         g["y0"] = min(g["ys"])

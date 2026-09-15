@@ -7,6 +7,17 @@ from pathlib import Path
 
 
 _WS = re.compile(r"\s+")
+_INLINE_MARKER = "PDT_INLINE"
+
+
+def _fragment_sort_key(item: dict) -> tuple[float, float, str]:
+    bbox = item.get("bbox") or ()
+    try:
+        x = float(bbox[0]) if len(bbox) > 0 else 0.0
+        y = float(bbox[1]) if len(bbox) > 1 else 0.0
+    except (TypeError, ValueError):
+        x = y = 0.0
+    return y, x, str(item.get("id", ""))
 
 
 def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
@@ -36,9 +47,42 @@ def block_layout_uid(page: int, column: str, bbox, text: str) -> str:
     return hashlib.sha256(payload).hexdigest()[:24]
 
 
+def inline_fragment_specs(block: dict) -> list[dict]:
+    """Return deterministic marker metadata for nested translation fragments."""
+    fragments = sorted(
+        (item for item in block.get("inline_fragments", []) if item.get("text")),
+        key=_fragment_sort_key,
+    )
+    specs = []
+    for index, fragment in enumerate(fragments):
+        salt = hashlib.sha256(
+            f"{fragment.get('id', '')}\0{fragment.get('text', '')}\0{fragment.get('bbox', '')}"
+            .encode("utf-8")
+        ).hexdigest()[:8]
+        token = f"{_INLINE_MARKER}_{index}_{salt}"
+        specs.append({
+            "id": fragment.get("id"),
+            "text": str(fragment.get("text", "")).strip(),
+            "math": bool(fragment.get("math_only") or fragment.get("has_math")),
+            "open": f"[[{token}]]",
+            "close": f"[[/{token}]]",
+        })
+    return specs
+
+
+def block_translation_source(block: dict) -> str:
+    """Compose the model source, including every nested fragment exactly once."""
+    source = str(block.get("text", "")).strip()
+    additions = [f"{spec['open']}{spec['text']}{spec['close']}"
+                 for spec in inline_fragment_specs(block)]
+    if additions:
+        source = source + "\n" + "\n".join(additions)
+    return source
+
+
 def block_identity(page: int, block: dict) -> dict[str, str]:
     """Compute identity from the block's current content and final geometry."""
-    text = block.get("text", "")
+    text = block_translation_source(block)
     return {
         "source_hash": block_source_hash(page, text),
         "layout_uid": block_layout_uid(

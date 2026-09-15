@@ -17,6 +17,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import auto_translate  # noqa: E402
+import audit_nested_blocks  # noqa: E402
 import build_dual  # noqa: E402
 import config  # noqa: E402
 import extract_blocks  # noqa: E402
@@ -158,6 +159,39 @@ class AutoTranslateTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertNotIn('"id": "a"', calls[1])
         self.assertIn('"id": "b"', calls[1])
+
+    def test_partial_json_rescues_only_contiguous_missing_runs(self):
+        calls = []
+
+        def fake_call_api(cfg, messages, timeout, temperature):
+            payload = json.loads(messages[-1]["content"])
+            calls.append([item["id"] for item in payload])
+            if len(calls) == 1:
+                return '{"a":"甲","c":"丙"}', {}
+            return json.dumps({item["id"]: item["id"].upper() for item in payload}), {}
+
+        args = SimpleNamespace(retry=0, split_depth=3, timeout=1.0,
+                               temperature=0.0, abort=threading.Event())
+        with mock.patch.object(auto_translate, "call_api", side_effect=fake_call_api):
+            out, _ = auto_translate.do_batch(
+                {"base": "http://example", "model": "m", "key": "k"},
+                [("a", "alpha"), ("b", "beta"), ("c", "charlie"), ("d", "delta")],
+                [], args)
+        self.assertEqual(calls, [["a", "b", "c", "d"], ["b"], ["d"]])
+        self.assertEqual(set(out), {"a", "b", "c", "d"})
+
+    def test_inline_math_marker_is_required_and_restored(self):
+        block = {"text": "Equation", "inline_fragments": [
+            {"id": "f", "text": "E=mc^2", "bbox": [10, 10, 20, 20],
+             "math_only": True},
+        ]}
+        spec = provenance.inline_fragment_specs(block)[0]
+        meta = {"p1b0": {"inline_fragments": [spec]}}
+        translated = f"方程 {spec['open']}changed{spec['close']}"
+        self.assertEqual(
+            auto_translate.finalize_translation("p1b0", translated, meta),
+            "方程E=mc^2")
+        self.assertIsNone(auto_translate.finalize_translation("p1b0", "方程", meta))
 
     def test_resume_rejects_stale_or_unhashed_entries_when_hash_available(self):
         valid, stats = auto_translate.filter_resume_entries(
@@ -311,6 +345,17 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(provenance.refresh_block_identities(data), 1)
         self.assertNotEqual(block["layout_uid"], before)
 
+    def test_identity_covers_inline_fragment_source(self):
+        block = {"id": "p1b0", "text": "outer", "column": "left",
+                 "bbox": [10, 20, 200, 40]}
+        before = provenance.block_identity(1, block)
+        block["inline_fragments"] = [
+            {"id": "p1b1", "text": "x^2", "bbox": [50, 25, 70, 35],
+             "math_only": True}]
+        after = provenance.block_identity(1, block)
+        self.assertNotEqual(before["source_hash"], after["source_hash"])
+        self.assertIn("PDT_INLINE_0", provenance.block_translation_source(block))
+
     def test_manifest_detects_replaced_source(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -406,6 +451,42 @@ class TableExtractionTests(unittest.TestCase):
         groups = extract_tables.group_by_caption(rules, caps, 300)
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["y1"], 260)
+
+    def test_stacked_tables_get_separate_caption_ownership(self):
+        caps = [
+            {"text": "Table 1", "bbox": [40, 90, 200, 110],
+             "y": 90, "y1": 110, "x0": 40, "x1": 200, "xc": 120},
+            {"text": "Table 2", "bbox": [40, 280, 200, 300],
+             "y": 280, "y1": 300, "x0": 40, "x1": 200, "xc": 120},
+        ]
+        rules = [(180, 40, 560), (220, 40, 560), (260, 40, 560),
+                 (310, 40, 560), (350, 40, 560), (390, 40, 560)]
+        groups = extract_tables.group_by_caption(rules, caps, 300)
+        self.assertEqual([(group["title"], group["ys"]) for group in groups], [
+            ("Table 1", [180, 220, 260]), ("Table 2", [310, 350, 390])])
+
+
+class NestedFragmentTests(unittest.TestCase):
+    def test_audit_attaches_ordered_inline_fragments(self):
+        with tempfile.TemporaryDirectory() as td_raw:
+            path = Path(td_raw) / "blocks.json"
+            data = {"pages": [{"page": 1, "blocks": [
+                {"id": "outer", "text": "body", "bbox": [10, 10, 200, 80]},
+                {"id": "later", "text": "y", "bbox": [80, 50, 90, 60],
+                 "math_only": True},
+                {"id": "earlier", "text": "x", "bbox": [50, 30, 60, 40],
+                 "math_only": True},
+            ]}]}
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with redirect_stdout(io.StringIO()):
+                rc = audit_nested_blocks.main(["--blocks", str(path), "--apply"])
+            self.assertEqual(rc, 0)
+            blocks = json.loads(path.read_text(encoding="utf-8"))["pages"][0]["blocks"]
+            outer = next(block for block in blocks if block["id"] == "outer")
+            self.assertEqual([item["id"] for item in outer["inline_fragments"]],
+                             ["earlier", "later"])
+            self.assertTrue(all(block.get("nested_in") == "outer"
+                                for block in blocks if block["id"] != "outer"))
 
 
 if __name__ == "__main__":

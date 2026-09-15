@@ -304,6 +304,8 @@ def build_messages(items, glossary, context=(), item_meta=None):
         "若带 continues_to_next=true，它的句意会在下一页继续。"
         "翻译当前 id 时必须结合前后相邻条目的语义，保持主语、指代、时态和句法连续，"
         "但仍按每个 id 分别返回译文，不得交换、合并或遗漏 id。"
+        "若 en 含成对的 [[PDT_INLINE_...]]...[[/PDT_INLINE_...]] 标记，必须原样保留标记；"
+        "标记内的数学内容保持不变，普通文本可翻译但不得删除。"
         "\n\n【输出契约】只输出一个 JSON 对象：键=输入 id，值=对应中文译文。"
         "不要输出任何解释、寒暄或 Markdown 代码块标记。"
     )
@@ -407,6 +409,41 @@ line two`` 仍保留词间空格。
     return t
 
 
+def finalize_translation(block_id: str, text: str, item_meta: dict | None) -> str | None:
+    """Validate inline markers and restore immutable math before accepting output."""
+    rendered = str(text or "")
+    specs = (item_meta or {}).get(block_id, {}).get("inline_fragments", [])
+    for spec in specs:
+        pattern = re.compile(re.escape(spec["open"]) + r"(.*?)" + re.escape(spec["close"]), re.S)
+        match = pattern.search(rendered)
+        if not match:
+            return None
+        inner = match.group(1).strip()
+        if spec.get("math"):
+            replacement = spec["text"]
+        elif inner:
+            replacement = inner
+        else:
+            return None
+        rendered = rendered[:match.start()] + replacement + rendered[match.end():]
+    return normalize_translation_text(rendered) or None
+
+
+def missing_contiguous_runs(items, completed_ids) -> list[list[tuple[str, str]]]:
+    """Keep rescue requests contiguous in the original response batch."""
+    completed_ids = set(completed_ids)
+    runs: list[list[tuple[str, str]]] = []
+    previous_position = None
+    for position, item in enumerate(items):
+        if item[0] in completed_ids:
+            continue
+        if not runs or previous_position is None or position != previous_position + 1:
+            runs.append([])
+        runs[-1].append(item)
+        previous_position = position
+    return runs
+
+
 def _merge_usage(a, b):
     out = dict(a)
     for k, v in (b or {}).items():
@@ -428,18 +465,34 @@ def do_batch(cfg, items, glossary, args, depth=0, context=(), item_meta=None):
         try:
             content, usage = call_api(cfg, messages, args.timeout, args.temperature)
             got = extract_json(content)
-            out = {i: normalize_translation_text(got[i]) for i, _ in items
-                   if isinstance(got.get(i), str) and normalize_translation_text(got[i])}
+            out = {}
+            for block_id, _ in items:
+                if not isinstance(got.get(block_id), str):
+                    continue
+                finalized = finalize_translation(block_id, got[block_id], item_meta)
+                if finalized:
+                    out[block_id] = finalized
             if out:
-                missing = [(i, t) for i, t in items if i not in out]
-                if not missing:
+                missing_runs = missing_contiguous_runs(items, out)
+                if not missing_runs:
                     return out, usage
                 if depth < args.split_depth:
-                    translated_context = tuple(t for i, t in items if i in out)
-                    rescued, rescued_usage = do_batch(
-                        cfg, missing, glossary, args, depth + 1,
-                        tuple(context) + translated_context, item_meta,
-                    )
+                    rescued, rescued_usage = {}, {}
+                    positions = {item[0]: index for index, item in enumerate(items)}
+                    for run in missing_runs:
+                        start = positions[run[0][0]]
+                        end = positions[run[-1][0]]
+                        run_context = list(context)
+                        if start > 0:
+                            run_context.append("前文: " + items[start - 1][1])
+                        if end + 1 < len(items):
+                            run_context.append("后文: " + items[end + 1][1])
+                        got_run, usage_run = do_batch(
+                            cfg, run, glossary, args, depth + 1,
+                            tuple(run_context), item_meta,
+                        )
+                        rescued.update(got_run)
+                        rescued_usage = _merge_usage(rescued_usage, usage_run)
                     return {**out, **rescued}, _merge_usage(usage, rescued_usage)
                 return out, usage
             err = "返回为空或不是合法 JSON"
@@ -738,7 +791,8 @@ def main(argv=None) -> int:
         for b in sorted(p.get("blocks", []), key=lambda x: x.get("flow_index", 10**9)):
             b["_page"] = pno
             b["text"] = re.sub(r"\s*\n\s*", " ", b.get("text", "")).strip()
-            flow_items.append((b["id"], b["text"]))
+            source_text = PROV.block_translation_source(b)
+            flow_items.append((b["id"], source_text))
             if (b.get("flow_break") or b.get("kind") in {
                     "heading", "table", "table_caption", "figure_caption", "math_only"}):
                 flow_breaks.add(b["id"])
@@ -757,11 +811,14 @@ def main(argv=None) -> int:
                 flags["continues_from_prev"] = True
             if b.get("continues_to_next"):
                 flags["continues_to_next"] = True
+            inline_specs = PROV.inline_fragment_specs(b)
+            if inline_specs:
+                flags["inline_fragments"] = inline_specs
             if flags:
                 item_meta[b["id"]] = flags
             if (existing.get(b["id"], {}) or {}).get("zh", "").strip():
                 continue
-            items.append((b["id"], b["text"]))
+            items.append((b["id"], source_text))
     if not ctx["counts"]:
         pass
     if args.limit:

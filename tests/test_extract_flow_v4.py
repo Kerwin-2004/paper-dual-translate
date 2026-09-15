@@ -105,9 +105,22 @@ class FlowV4Tests(unittest.TestCase):
                 {"bbox": [40, 195, 560, 207], "spans": [{"text": "body below"}]},
             ],
         }
-        parts = M.split_at_horizontal_boundaries(raw, [140, 180])
+        parts = M.split_at_table_boundaries(raw, [[40, 140, 560, 180]])
         self.assertEqual([M.block_text(part) for part in parts], [
             "Table 1. Results continued caption", "Method Score", "body below"])
+
+    def test_left_table_boundaries_do_not_split_right_column_paragraph(self):
+        raw = {
+            "type": 0, "bbox": [330, 90, 560, 210],
+            "lines": [
+                {"bbox": [330, 90, 560, 102], "spans": [{"text": "right one"}]},
+                {"bbox": [330, 145, 560, 157], "spans": [{"text": "right two"}]},
+                {"bbox": [330, 195, 560, 207], "spans": [{"text": "right three"}]},
+            ],
+        }
+        parts = M.split_at_table_boundaries(raw, [[40, 140, 280, 180]])
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(M.block_text(parts[0]), "right one right two right three")
 
     def test_wide_layout_barrier_splits_reading_zones(self):
         blocks = [
@@ -152,6 +165,28 @@ class FlowV4Tests(unittest.TestCase):
         M.mark_page_continuations([previous, following])
         self.assertTrue(previous["blocks"][0]["continues_to_next"])
         self.assertTrue(following["blocks"][1]["continues_from_prev"])
+
+    def test_page_edge_image_barrier_prevents_continuation(self):
+        previous = {"page": 1, "layout_barriers": [
+            {"kind": "image", "bbox": [50, 730, 550, 790]},
+        ], "blocks": [
+            {**blk("unfinished sentence", 680, 710), "flow_index": 0},
+        ]}
+        following = {"page": 2, "blocks": [
+            {**blk("continues here.", 40, 60), "flow_index": 0},
+        ]}
+        M.mark_page_continuations([previous, following])
+        self.assertNotIn("continues_to_next", previous["blocks"][0])
+
+    def test_first_body_flow_break_prevents_continuation(self):
+        previous = {"page": 1, "blocks": [
+            {**blk("unfinished sentence", 680, 710), "flow_index": 0},
+        ]}
+        following = {"page": 2, "blocks": [
+            {**blk("new text.", 100, 120), "flow_index": 0, "flow_break": True},
+        ]}
+        M.mark_page_continuations([previous, following])
+        self.assertNotIn("continues_to_next", previous["blocks"][0])
 
 
 if __name__ == "__main__":

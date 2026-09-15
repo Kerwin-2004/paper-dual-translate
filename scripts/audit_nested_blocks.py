@@ -10,7 +10,7 @@
 处理方案（--apply 自动执行）：
   - 簇内所有块合并为**单个插入块**：外层块 bbox 扩到并集；
   - 碎片块标记 "nested_in": <外层块id>，build_dual 会自动跳过它们；
-  - 翻译时把碎片内容（公式用 ASCII 记号）并入外层块的中文里。
+  - 外层块记录有序 inline_fragments，供自动翻译以不可丢失标记注入。
 
 用法:
   python audit_nested_blocks.py --blocks blocks.json                 # 只报告
@@ -132,7 +132,7 @@ def main(argv=None) -> int:
             print(f"        碎片 {fr['id']} {math} [{fs}] {fr['text'][:50]!r}")
 
     if args.apply:
-        n_bbox = n_mark = 0
+        n_bbox = n_mark = n_inline = 0
         for oid, cl in clusters.items():
             if not actionable(cl):
                 continue  # 纯公式内部结构，不动 blocks.json
@@ -147,9 +147,22 @@ def main(argv=None) -> int:
                 if not fr.get("nested_in"):
                     fr["nested_in"] = oid
                     n_mark += 1
+            inline_fragments = [{
+                "id": fr["id"],
+                "text": fr.get("text", ""),
+                "bbox": [round(float(v), 2) for v in fr.get("bbox", ())],
+                "kind": fr.get("kind"),
+                "math_only": bool(fr.get("math_only")),
+                "has_math": bool(fr.get("has_math")),
+            } for fr in sorted(
+                cl["frags"], key=lambda item: (
+                    float(item["bbox"][1]), float(item["bbox"][0]), item["id"]))]
+            if cl["outer"].get("inline_fragments") != inline_fragments:
+                cl["outer"]["inline_fragments"] = inline_fragments
+                n_inline += len(inline_fragments)
         f.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        print(f"已修补 {f}: 扩 bbox {n_bbox} 处、标记碎片 {n_mark} 个")
-        print("提醒: 翻译时需把碎片内容（公式用 ASCII 记号）并入外层块的中文。")
+        print(f"已修补 {f}: 扩 bbox {n_bbox} 处、标记碎片 {n_mark} 个、"
+              f"挂接 inline fragment {n_inline} 个")
 
     if args.skeleton:
         sk = {}

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,8 +14,11 @@ sys.path.insert(0, str(SCRIPTS))
 
 import extract_blocks  # noqa: E402
 import extract_tables  # noqa: E402
+import audit_nested_blocks  # noqa: E402
+import auto_translate  # noqa: E402
 import build_dual  # noqa: E402
 import debug_flow  # noqa: E402
+import provenance  # noqa: E402
 
 try:
     import fitz
@@ -24,6 +28,66 @@ except ImportError:  # pragma: no cover - CI installs the runtime dependency
 
 @unittest.skipIf(fitz is None, "PyMuPDF is required for PDF integration fixtures")
 class PdfLayoutIntegrationTests(unittest.TestCase):
+    def test_auto_translation_preserves_nested_math_in_built_pdf(self):
+        with tempfile.TemporaryDirectory() as td_raw:
+            td = Path(td_raw)
+            source = td / "nested.pdf"
+            blocks_path = td / "blocks.json"
+            translations_path = td / "translations.json"
+            output_path = td / "dual.pdf"
+
+            doc = fitz.open()
+            page = doc.new_page(width=600, height=800)
+            page.insert_text((40, 110), "The controller uses an embedded equation.", fontsize=10)
+            page.insert_text((250, 135), "E=mc^2", fontsize=10)
+            doc.save(source)
+            doc.close()
+
+            common = {"page": 1, "column": "left", "size": 10, "font": "Times",
+                      "bold": False, "heading": False, "color": 0, "has_math": False}
+            blocks = {"schema_version": 4, "page_count": 1, "pages": [{
+                "page": 1, "width": 600, "height": 800, "blocks": [
+                    {**common, "id": "p1b0", "text": "The controller uses an embedded equation.",
+                     "bbox": [35, 90, 565, 155], "kind": "body", "math_only": False,
+                     "flow_index": 0},
+                    {**common, "id": "p1b1", "text": "E=mc^2",
+                     "bbox": [245, 120, 330, 145], "kind": "math_only", "math_only": True,
+                     "has_math": True, "flow_index": 1},
+                ], "layout_barriers": [],
+            }]}
+            blocks_path.write_text(json.dumps(blocks), encoding="utf-8")
+            self.assertEqual(audit_nested_blocks.main([
+                "--blocks", str(blocks_path), "--apply"]), 0)
+            blocks = json.loads(blocks_path.read_text(encoding="utf-8"))
+            provenance.refresh_block_identities(blocks)
+            blocks_path.write_text(json.dumps(blocks), encoding="utf-8")
+
+            def fake_call_api(cfg, messages, timeout, temperature):
+                payload = json.loads(messages[-1]["content"])
+                result = {}
+                for item in payload:
+                    markers = " ".join(part for part in item["en"].splitlines()
+                                       if "PDT_INLINE" in part)
+                    result[item["id"]] = "控制器使用嵌入方程 " + markers
+                return json.dumps(result, ensure_ascii=False), {}
+
+            with mock.patch.object(auto_translate, "call_api", side_effect=fake_call_api):
+                self.assertEqual(auto_translate.main([
+                    "--blocks", str(blocks_path), "--output", str(translations_path),
+                    "--api-key", "fixture", "--workers", "1",
+                ]), 0)
+            translations = json.loads(translations_path.read_text(encoding="utf-8"))
+            self.assertIn("E=mc^2", translations["p1b0"]["zh"])
+
+            self.assertEqual(build_dual.main([
+                "--source", str(source), "--blocks", str(blocks_path),
+                "--translations", str(translations_path), "--output", str(output_path),
+            ]), 0)
+            output = fitz.open(output_path)
+            right_text = output[0].get_text(clip=fitz.Rect(600, 0, 1200, 800))
+            output.close()
+            self.assertIn("E=mc", right_text)
+
     def test_cross_page_paragraph_sets_continuation_metadata(self):
         with tempfile.TemporaryDirectory() as td_raw:
             td = Path(td_raw)
