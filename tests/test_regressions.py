@@ -210,9 +210,12 @@ class AutoTranslateTests(unittest.TestCase):
                             f"{first['open']}x{first['close']}")
         residual = (f"{first['open']}x{first['close']} "
                     f"{second['open']}y{second['close']} [[PDT_INLINE_unknown]]")
+        crossing = (f"{first['open']}outer {second['open']}inner "
+                    f"{first['close']} tail{second['close']}")
         self.assertIsNone(auto_translate.finalize_translation("p1b0", duplicate, meta))
         self.assertIsNone(auto_translate.finalize_translation("p1b0", reversed_markers, meta))
         self.assertIsNone(auto_translate.finalize_translation("p1b0", residual, meta))
+        self.assertIsNone(auto_translate.finalize_translation("p1b0", crossing, meta))
 
     def test_resume_rejects_stale_or_unhashed_entries_when_hash_available(self):
         valid, stats = auto_translate.filter_resume_entries(
@@ -387,6 +390,19 @@ class ProvenanceTests(unittest.TestCase):
         self.assertIn("]]pi(a|s)[[/PDT_INLINE_", source)
         self.assertTrue(source.endswith("]] as the policy."))
 
+    def test_marker_identity_does_not_depend_on_ephemeral_child_id(self):
+        fragment = {"id": "p4b11", "page": 4, "text": "x^2", "kind": "math_only",
+                    "bbox": [50.1, 25.1, 70.1, 35.1], "anchor_offset": 6,
+                    "math_only": True}
+        first = {"text": "value is defined", "column": "left",
+                 "bbox": [10, 20, 200, 40], "inline_fragments": [fragment]}
+        second = json.loads(json.dumps(first))
+        second["inline_fragments"][0]["id"] = "p4b12"
+        self.assertEqual(provenance.block_translation_source(first),
+                         provenance.block_translation_source(second))
+        self.assertEqual(provenance.block_identity(4, first),
+                         provenance.block_identity(4, second))
+
     def test_manifest_detects_replaced_source(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -452,6 +468,15 @@ class TranslationHashTests(unittest.TestCase):
         self.assertEqual(mismatch[0][1], "layout_uid")
         self.assertEqual(unverified, 0)
 
+    def test_absorbed_child_identity_is_ignored(self):
+        child = {"id": "p1b1", "text": "x^2", "column": "left",
+                 "bbox": [50, 20, 70, 35], "nested_in": "p1b0"}
+        blocks = {"schema_version": 4, "pages": [{"page": 1, "blocks": [child]}]}
+        mismatch, unverified = build_dual.validate_translation_identities(
+            blocks, {"p1b1": {"zh": "旧译文", "source_hash": "old"}})
+        self.assertEqual(mismatch, [])
+        self.assertEqual(unverified, 0)
+
 
 class TableExtractionTests(unittest.TestCase):
     def test_caption_stops_before_rule_inside_same_text_block(self):
@@ -495,6 +520,17 @@ class TableExtractionTests(unittest.TestCase):
         groups = extract_tables.group_by_caption(rules, caps, 300)
         self.assertEqual([(group["title"], group["ys"]) for group in groups], [
             ("Table 1", [180, 220, 260]), ("Table 2", [310, 350, 390])])
+
+    def test_captionless_rules_survive_when_page_has_another_caption(self):
+        caps = [{"text": "Table 1", "bbox": [40, 90, 220, 105],
+                 "y": 90, "y1": 105, "x0": 40, "x1": 220, "xc": 130}]
+        rules = [(120, 40, 260), (140, 40, 260), (160, 40, 260),
+                 (200, 330, 560), (220, 330, 560), (240, 330, 560)]
+        groups = extract_tables.table_groups(rules, caps, 300)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0]["title"], "Table 1")
+        self.assertTrue(groups[1]["captionless"])
+        self.assertEqual(groups[1]["ys"], [200, 220, 240])
 
 
 class NestedFragmentTests(unittest.TestCase):
@@ -546,6 +582,23 @@ class NestedFragmentTests(unittest.TestCase):
             self.assertEqual(inline["anchor_offset"], len("We define "))
             source = provenance.block_translation_source(updated)
             self.assertIn("]]pi(a|s)[[/PDT_INLINE_", source)
+
+    def test_display_equation_anchors_between_physical_lines(self):
+        outer = {
+            "text": "We define the objective as and optimize it.",
+            "bbox": [10, 10, 220, 90], "size": 10,
+            "source_lines": [
+                {"text": "We define the objective as", "bbox": [10, 15, 180, 27],
+                 "spans": [{"text": "We define the objective as",
+                            "bbox": [10, 15, 180, 27]}]},
+                {"text": "and optimize it.", "bbox": [10, 73, 120, 85],
+                 "spans": [{"text": "and optimize it.",
+                            "bbox": [10, 73, 120, 85]}]},
+            ],
+        }
+        formula = {"text": "J(theta)", "bbox": [75, 38, 145, 62]}
+        offset = audit_nested_blocks.fragment_anchor_offset(outer, formula)
+        self.assertEqual(offset, len("We define the objective as"))
 
 
 if __name__ == "__main__":

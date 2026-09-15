@@ -60,8 +60,12 @@ def inline_fragment_specs(block: dict) -> list[dict]:
     )
     specs = []
     for index, fragment in enumerate(fragments):
+        bbox = fragment.get("bbox") or ()
+        quantized_bbox = ",".join(
+            f"{round(float(value) * 2) / 2:.1f}" for value in bbox)
         salt = hashlib.sha256(
-            f"{fragment.get('id', '')}\0{fragment.get('text', '')}\0{fragment.get('bbox', '')}"
+            f"{fragment.get('page', '')}\0{quantized_bbox}\0"
+            f"{fragment.get('text', '')}\0{fragment.get('kind', '')}"
             .encode("utf-8")
         ).hexdigest()[:8]
         token = f"{_INLINE_MARKER}_{index}_{salt}"

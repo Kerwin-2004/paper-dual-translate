@@ -85,12 +85,14 @@ def cluster_rules(rules, y_tol=30.0, x_overlap=0.5):
         for g in groups:
             if (y - g["y1"]) <= y_tol and _overlap(x0, x1, g["x0"], g["x1"]) >= x_overlap:
                 g["ys"].append(y)
+                g["rules"].append((y, x0, x1))
                 g["y1"] = max(g["y1"], y)
                 g["x0"] = min(g["x0"], x0)
                 g["x1"] = max(g["x1"], x1)
                 break
         else:
-            groups.append({"ys": [y], "y0": y, "y1": y, "x0": x0, "x1": x1})
+            groups.append({"ys": [y], "rules": [(y, x0, x1)],
+                           "y0": y, "y1": y, "x0": x0, "x1": x1})
     return groups
 
 
@@ -171,9 +173,11 @@ def caption_lines(page, rules):
     return sorted(caps, key=lambda c: (c["y"], c["x0"]))
 
 
-def group_by_caption(rules, caps, page_mid, max_caption_gap=80.0):
+def group_by_caption(rules, caps, page_mid, max_caption_gap=80.0,
+                     return_consumed=False):
     """Assign rules to caption ownership windows before clustering tables."""
     groups = []
+    consumed = set()
     owned: dict[int, list[tuple[float, float, float]]] = {
         index: [] for index in range(len(caps))}
     for y, x0, x1 in rules:
@@ -200,13 +204,30 @@ def group_by_caption(rules, caps, page_mid, max_caption_gap=80.0):
                 continue
             groups.append({"cap": cap, "ys": list(candidate["ys"]),
                            "x0": candidate["x0"], "x1": candidate["x1"]})
+            consumed.update(candidate["rules"])
     for g in groups:
         g["ys"] = sorted(set(g["ys"]))
         g["y0"] = min(g["ys"])
         g["y1"] = max(g["ys"])
         g["title"] = g["cap"]["text"]
         g["caption_bbox"] = g["cap"]["bbox"]
-    return sorted(groups, key=lambda g: (g["y0"], g["x0"]))
+    groups = sorted(groups, key=lambda g: (g["y0"], g["x0"]))
+    return (groups, consumed) if return_consumed else groups
+
+
+def table_groups(rules, caps, page_mid):
+    """Keep caption-owned tables and strictly cluster every unconsumed rule."""
+    if not caps:
+        groups = cluster_rules(rules, y_tol=30.0, x_overlap=0.65)
+        return [dict(group, captionless=True) for group in groups
+                if len(group["ys"]) >= 2]
+    captioned, consumed = group_by_caption(
+        rules, caps, page_mid, return_consumed=True)
+    remaining = [rule for rule in rules if rule not in consumed]
+    fallback = [dict(group, captionless=True)
+                for group in cluster_rules(remaining, y_tol=30.0, x_overlap=0.65)
+                if len(group["ys"]) >= 2]
+    return sorted(captioned + fallback, key=lambda group: (group["y0"], group["x0"]))
 
 
 def line_rows(page, x0, x1, y0, y1):
@@ -266,14 +287,7 @@ def main(argv=None) -> int:
         if not rules:
             continue
         caps = caption_lines(page, rules)
-        if caps:
-            groups = group_by_caption(rules, caps, page.rect.width / 2)
-            mode = "题注锚定"
-        else:
-            groups = cluster_rules(rules)
-            # 无题注兜底：滤掉装饰性下划线/图框（那些格子极少）
-            groups = [g for g in groups if len(g["ys"]) >= 2]
-            mode = "横线聚类"
+        groups = table_groups(rules, caps, page.rect.width / 2)
         if not groups:
             continue
         page_rec = {"page": pno + 1, "tables": []}
@@ -299,7 +313,7 @@ def main(argv=None) -> int:
                         "bbox": [round(bx0, 2), round(by0, 2), round(bx1, 2), round(by1, 2)],
                         "text": txt,
                     })
-            if cells and (mode == "题注锚定" or len(cells) >= 4):
+            if cells and (not g.get("captionless") or len(cells) >= 4):
                 page_rec["tables"].append({
                     "index": gi,
                     "region": [round(x0, 2), round(y_top, 2), round(x1, 2), round(y_bot, 2)],

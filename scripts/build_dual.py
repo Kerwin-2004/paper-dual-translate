@@ -318,14 +318,19 @@ def insert_fitted(page, rect, text, fontname, fontfile, color, start_size, align
 
 def validate_translation_identities(blocks_data: dict, trans: dict):
     expected = {}
+    absorbed = set()
     for page in blocks_data.get("pages", []):
         page_no = int(page.get("page", 0))
         for block in page.get("blocks", []):
             expected[block["id"]] = PROV.block_identity(page_no, block)
+            if block.get("nested_in"):
+                absorbed.add(block["id"])
     mismatch = []
     unverified = 0
     strict_v4 = int(blocks_data.get("schema_version", 0) or 0) >= 4
     for bid, value in (trans or {}).items():
+        if bid in absorbed:
+            continue
         if not isinstance(value, dict):
             continue
         if not ((value.get("zh") or "").strip() or value.get("skip") or value.get("blank")):

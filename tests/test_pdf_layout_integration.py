@@ -88,7 +88,7 @@ class PdfLayoutIntegrationTests(unittest.TestCase):
 
             # Even a manually retained legacy child translation must never render.
             translations["p1b1"] = {
-                "zh": "DUPLICATE CHILD", **provenance.block_identity(1, child),
+                "zh": "DUPLICATE CHILD", "source_hash": "old", "layout_uid": "old",
             }
             translations_path.write_text(json.dumps(translations), encoding="utf-8")
 
@@ -224,6 +224,47 @@ class PdfLayoutIntegrationTests(unittest.TestCase):
             self.assertEqual(len(captions), 1)
             self.assertIn("Applications of LLM4RL", captions[0]["text"])
             self.assertNotIn("Method", captions[0]["text"])
+
+    def test_captionless_table_survives_beside_captioned_table(self):
+        with tempfile.TemporaryDirectory() as td_raw:
+            td = Path(td_raw)
+            source = td / "mixed-tables.pdf"
+            tables_path = td / "tables.json"
+            blocks_path = td / "blocks.json"
+            doc = fitz.open()
+            page = doc.new_page(width=600, height=800)
+            page.insert_text((40, 100), "Table 1. Left results", fontsize=10)
+            for y in (120, 150, 180):
+                page.draw_line((40, y), (270, y), width=0.8)
+            page.insert_text((50, 140), "L1", fontsize=9)
+            page.insert_text((200, 140), "1", fontsize=9)
+            page.insert_text((50, 170), "L2", fontsize=9)
+            page.insert_text((200, 170), "2", fontsize=9)
+
+            for y in (220, 250, 280):
+                page.draw_line((330, y), (560, y), width=0.8)
+            page.insert_text((340, 240), "R1", fontsize=9)
+            page.insert_text((500, 240), "3", fontsize=9)
+            page.insert_text((340, 270), "R2", fontsize=9)
+            page.insert_text((500, 270), "4", fontsize=9)
+            doc.save(source)
+            doc.close()
+
+            self.assertEqual(extract_tables.main([
+                "--input", str(source), "--output", str(tables_path)]), 0)
+            data = json.loads(tables_path.read_text(encoding="utf-8"))
+            tables = data["pages"][0]["tables"]
+            self.assertEqual(len(tables), 2)
+            captionless = next(table for table in tables if table["caption"] is None)
+            self.assertIn("R1", {cell["text"] for cell in captionless["cells"]})
+
+            self.assertEqual(extract_blocks.main([
+                "--input", str(source), "--output", str(blocks_path),
+                "--tables", str(tables_path)]), 0)
+            blocks = json.loads(blocks_path.read_text(encoding="utf-8"))["pages"][0]["blocks"]
+            right_table = [block for block in blocks if "R" in block["text"]]
+            self.assertTrue(right_table)
+            self.assertTrue(all(block["kind"] == "table" for block in right_table))
 
 
 if __name__ == "__main__":

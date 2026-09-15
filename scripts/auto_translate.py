@@ -413,17 +413,16 @@ def finalize_translation(block_id: str, text: str, item_meta: dict | None) -> st
     """Enforce an exact ordered marker round trip before accepting output."""
     rendered = str(text or "")
     specs = (item_meta or {}).get(block_id, {}).get("inline_fragments", [])
-    positions = []
+    previous_close = -1
     for spec in specs:
         if rendered.count(spec["open"]) != 1 or rendered.count(spec["close"]) != 1:
             return None
         open_at = rendered.find(spec["open"])
         close_at = rendered.find(spec["close"])
-        if close_at < open_at + len(spec["open"]):
+        if (close_at < open_at + len(spec["open"])
+                or open_at < previous_close):
             return None
-        positions.append(open_at)
-    if positions != sorted(positions):
-        return None
+        previous_close = close_at + len(spec["close"])
     for spec in specs:
         pattern = re.compile(re.escape(spec["open"]) + r"(.*?)" + re.escape(spec["close"]), re.S)
         match = pattern.search(rendered)

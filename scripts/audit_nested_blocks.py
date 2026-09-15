@@ -68,19 +68,9 @@ def fragment_anchor_offset(outer: dict, fragment: dict) -> int:
              if line.get("bbox") and len(line["bbox"]) == 4]
     if lines:
         lines.sort(key=lambda line: (float(line["bbox"][1]), float(line["bbox"][0])))
-
-        def line_distance(line):
-            x0, y0, x1, y1 = [float(value) for value in line["bbox"]]
-            dy = 0.0 if y0 <= fy <= y1 else min(abs(fy - y0), abs(fy - y1))
-            dx = 0.0 if x0 <= fx <= x1 else min(abs(fx - x0), abs(fx - x1))
-            return dy, dx
-
-        target = min(lines, key=line_distance)
         line_texts = [re.sub(r"\s+", " ", str(line.get("text", ""))).strip()
                       for line in lines]
-        target_index = lines.index(target)
         nominal_total = max(1, sum(len(value) + 1 for value in line_texts) - 1)
-        line_text = line_texts[target_index]
         search_cursor = 0
         line_starts = []
         for index, value in enumerate(line_texts):
@@ -91,6 +81,30 @@ def fragment_anchor_offset(outer: dict, fragment: dict) -> int:
             else:
                 before = sum(len(item) + 1 for item in line_texts[:index])
                 line_starts.append(round(before / nominal_total * len(text)))
+
+        fragment_y0, fragment_y1 = float(fb[1]), float(fb[3])
+        overlaps = []
+        for index, line in enumerate(lines):
+            line_y0, line_y1 = float(line["bbox"][1]), float(line["bbox"][3])
+            overlap = max(0.0, min(fragment_y1, line_y1) - max(fragment_y0, line_y0))
+            if overlap > 0:
+                overlaps.append((overlap, index))
+        if not overlaps:
+            if fragment_y1 <= float(lines[0]["bbox"][1]):
+                return 0
+            if fragment_y0 >= float(lines[-1]["bbox"][3]):
+                return len(text)
+            preceding = [index for index, line in enumerate(lines)
+                         if float(line["bbox"][3]) <= fy]
+            if not preceding:
+                return 0
+            index = preceding[-1]
+            return _nearest_text_boundary(
+                text, line_starts[index] + len(line_texts[index]))
+
+        target_index = max(overlaps)[1]
+        target = lines[target_index]
+        line_text = line_texts[target_index]
         line_start = line_starts[target_index]
 
         spans = sorted(
@@ -173,6 +187,10 @@ def main(argv=None) -> int:
 
     f = Path(args.blocks).resolve()
     data = json.loads(f.read_text(encoding="utf-8"))
+    block_pages = {
+        block["id"]: int(page.get("page", 0))
+        for page in data.get("pages", []) for block in page.get("blocks", [])
+    }
     trans = {}
     if args.translations and Path(args.translations).is_file():
         trans = json.loads(Path(args.translations).read_text(encoding="utf-8"))
@@ -229,6 +247,7 @@ def main(argv=None) -> int:
                 "math_only": bool(fr.get("math_only")),
                 "has_math": bool(fr.get("has_math")),
                 "anchor_offset": fragment_anchor_offset(cl["outer"], fr),
+                "page": block_pages.get(fr["id"]),
             } for fr in sorted(
                 cl["frags"], key=lambda item: (
                     float(item["bbox"][1]), float(item["bbox"][0]), item["id"]))]
