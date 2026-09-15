@@ -193,6 +193,27 @@ class AutoTranslateTests(unittest.TestCase):
             "方程E=mc^2")
         self.assertIsNone(auto_translate.finalize_translation("p1b0", "方程", meta))
 
+    def test_inline_markers_must_be_unique_ordered_and_leave_no_residue(self):
+        block = {"text": "A B", "inline_fragments": [
+            {"id": "x", "text": "x", "bbox": [10, 10, 20, 20],
+             "anchor_offset": 1, "math_only": True},
+            {"id": "y", "text": "y", "bbox": [30, 10, 40, 20],
+             "anchor_offset": 3, "math_only": True},
+        ]}
+        specs = provenance.inline_fragment_specs(block)
+        meta = {"p1b0": {"inline_fragments": specs}}
+        first, second = specs
+        duplicate = (f"{first['open']}x{first['close']} "
+                     f"{first['open']}x{first['close']} "
+                     f"{second['open']}y{second['close']}")
+        reversed_markers = (f"{second['open']}y{second['close']} "
+                            f"{first['open']}x{first['close']}")
+        residual = (f"{first['open']}x{first['close']} "
+                    f"{second['open']}y{second['close']} [[PDT_INLINE_unknown]]")
+        self.assertIsNone(auto_translate.finalize_translation("p1b0", duplicate, meta))
+        self.assertIsNone(auto_translate.finalize_translation("p1b0", reversed_markers, meta))
+        self.assertIsNone(auto_translate.finalize_translation("p1b0", residual, meta))
+
     def test_resume_rejects_stale_or_unhashed_entries_when_hash_available(self):
         valid, stats = auto_translate.filter_resume_entries(
             {
@@ -356,6 +377,16 @@ class ProvenanceTests(unittest.TestCase):
         self.assertNotEqual(before["source_hash"], after["source_hash"])
         self.assertIn("PDT_INLINE_0", provenance.block_translation_source(block))
 
+    def test_inline_fragment_is_inserted_at_anchor_offset(self):
+        block = {"text": "We define as the policy.", "inline_fragments": [
+            {"id": "formula", "text": "pi(a|s)", "bbox": [70, 10, 100, 20],
+             "anchor_offset": len("We define "), "math_only": True},
+        ]}
+        source = provenance.block_translation_source(block)
+        self.assertTrue(source.startswith("We define [[PDT_INLINE_"))
+        self.assertIn("]]pi(a|s)[[/PDT_INLINE_", source)
+        self.assertTrue(source.endswith("]] as the policy."))
+
     def test_manifest_detects_replaced_source(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -487,6 +518,34 @@ class NestedFragmentTests(unittest.TestCase):
                              ["earlier", "later"])
             self.assertTrue(all(block.get("nested_in") == "outer"
                                 for block in blocks if block["id"] != "outer"))
+
+    def test_audit_anchors_fragment_between_nearby_spans(self):
+        with tempfile.TemporaryDirectory() as td_raw:
+            path = Path(td_raw) / "blocks.json"
+            outer = {
+                "id": "outer", "text": "We define as the policy.",
+                "bbox": [10, 10, 220, 50], "size": 10,
+                "source_lines": [{
+                    "text": "We define as the policy.", "bbox": [10, 15, 210, 30],
+                    "spans": [
+                        {"text": "We define ", "bbox": [10, 15, 75, 30]},
+                        {"text": "as the policy.", "bbox": [105, 15, 210, 30]},
+                    ],
+                }],
+            }
+            fragment = {"id": "formula", "text": "pi(a|s)",
+                        "bbox": [78, 15, 102, 30], "math_only": True}
+            path.write_text(json.dumps({"pages": [{"page": 1, "blocks": [
+                outer, fragment]}]}), encoding="utf-8")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(audit_nested_blocks.main([
+                    "--blocks", str(path), "--apply"]), 0)
+            blocks = json.loads(path.read_text(encoding="utf-8"))["pages"][0]["blocks"]
+            updated = next(block for block in blocks if block["id"] == "outer")
+            inline = updated["inline_fragments"][0]
+            self.assertEqual(inline["anchor_offset"], len("We define "))
+            source = provenance.block_translation_source(updated)
+            self.assertIn("]]pi(a|s)[[/PDT_INLINE_", source)
 
 
 if __name__ == "__main__":

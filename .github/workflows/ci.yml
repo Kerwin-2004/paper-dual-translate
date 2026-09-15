@@ -21,6 +21,9 @@ jobs:
             pymupdf-spec: ">=1.24"
             pymupdf-label: "latest PyMuPDF"
           - python-version: "3.12"
+            pymupdf-spec: "==1.24.0"
+            pymupdf-label: "minimum PyMuPDF"
+          - python-version: "3.12"
             pymupdf-spec: ">=1.24"
             pymupdf-label: "latest PyMuPDF"
     steps:

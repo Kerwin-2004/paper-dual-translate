@@ -10,14 +10,19 @@ _WS = re.compile(r"\s+")
 _INLINE_MARKER = "PDT_INLINE"
 
 
-def _fragment_sort_key(item: dict) -> tuple[float, float, str]:
+def _fragment_sort_key(item: dict) -> tuple[float, float, float, str]:
     bbox = item.get("bbox") or ()
     try:
         x = float(bbox[0]) if len(bbox) > 0 else 0.0
         y = float(bbox[1]) if len(bbox) > 1 else 0.0
     except (TypeError, ValueError):
         x = y = 0.0
-    return y, x, str(item.get("id", ""))
+    anchor = item.get("anchor_offset")
+    try:
+        anchor_value = float(anchor) if anchor is not None else float("inf")
+    except (TypeError, ValueError):
+        anchor_value = float("inf")
+    return anchor_value, y, x, str(item.get("id", ""))
 
 
 def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
@@ -66,17 +71,35 @@ def inline_fragment_specs(block: dict) -> list[dict]:
             "math": bool(fragment.get("math_only") or fragment.get("has_math")),
             "open": f"[[{token}]]",
             "close": f"[[/{token}]]",
+            "anchor_offset": fragment.get("anchor_offset"),
         })
     return specs
 
 
 def block_translation_source(block: dict) -> str:
-    """Compose the model source, including every nested fragment exactly once."""
+    """Compose model source with nested fragments at their geometric anchors."""
     source = str(block.get("text", "")).strip()
-    additions = [f"{spec['open']}{spec['text']}{spec['close']}"
-                 for spec in inline_fragment_specs(block)]
-    if additions:
-        source = source + "\n" + "\n".join(additions)
+    trailing = []
+    anchored = []
+    for order, spec in enumerate(inline_fragment_specs(block)):
+        marker = f"{spec['open']}{spec['text']}{spec['close']}"
+        try:
+            offset = int(spec["anchor_offset"])
+        except (TypeError, ValueError):
+            trailing.append(marker)
+            continue
+        offset = max(0, min(len(source), offset))
+        if offset > 0 and not source[offset - 1].isspace() \
+                and source[offset - 1] not in "([{（【":
+            marker = " " + marker
+        if offset < len(source) and not source[offset].isspace() \
+                and source[offset] not in ",.;:!?)]}，。；：！？）】":
+            marker = marker + " "
+        anchored.append((offset, order, marker))
+    for offset, _, marker in reversed(anchored):
+        source = source[:offset] + marker + source[offset:]
+    if trailing:
+        source = source + "\n" + "\n".join(trailing)
     return source
 
 

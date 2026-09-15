@@ -20,6 +20,16 @@ def blk(text, y0, y1, x0=50, x1=250, size=10, column="left", kind="body"):
 
 
 class FlowV4Tests(unittest.TestCase):
+    def test_source_line_records_keep_span_geometry(self):
+        raw = {"lines": [{
+            "bbox": [10, 20, 100, 32],
+            "spans": [{"text": "left ", "bbox": [10, 20, 40, 32]},
+                      {"text": "right", "bbox": [60, 20, 100, 32]}],
+        }]}
+        records = M.source_line_records(raw)
+        self.assertEqual(records[0]["text"], "left right")
+        self.assertEqual(records[0]["spans"][1]["bbox"], [60.0, 20.0, 100.0, 32.0])
+
     def test_tight_blocks_merge_even_after_period(self):
         self.assertTrue(M.can_merge(
             blk("This is one sentence.", 100, 110),

@@ -61,6 +61,10 @@ class PdfLayoutIntegrationTests(unittest.TestCase):
             blocks = json.loads(blocks_path.read_text(encoding="utf-8"))
             provenance.refresh_block_identities(blocks)
             blocks_path.write_text(json.dumps(blocks), encoding="utf-8")
+            child = blocks["pages"][0]["blocks"][1]
+            translations_path.write_text(json.dumps({
+                "p1b1": {"zh": "DUPLICATE CHILD", **provenance.block_identity(1, child)},
+            }), encoding="utf-8")
 
             def fake_call_api(cfg, messages, timeout, temperature):
                 payload = json.loads(messages[-1]["content"])
@@ -74,10 +78,19 @@ class PdfLayoutIntegrationTests(unittest.TestCase):
             with mock.patch.object(auto_translate, "call_api", side_effect=fake_call_api):
                 self.assertEqual(auto_translate.main([
                     "--blocks", str(blocks_path), "--output", str(translations_path),
-                    "--api-key", "fixture", "--workers", "1",
+                    "--api-key", "fixture", "--workers", "1", "--no-skip",
                 ]), 0)
             translations = json.loads(translations_path.read_text(encoding="utf-8"))
             self.assertIn("E=mc^2", translations["p1b0"]["zh"])
+            self.assertEqual(translations["p1b1"]["absorbed_into"], "p1b0")
+            self.assertTrue(translations["p1b1"]["skip"])
+            self.assertNotIn("zh", translations["p1b1"])
+
+            # Even a manually retained legacy child translation must never render.
+            translations["p1b1"] = {
+                "zh": "DUPLICATE CHILD", **provenance.block_identity(1, child),
+            }
+            translations_path.write_text(json.dumps(translations), encoding="utf-8")
 
             self.assertEqual(build_dual.main([
                 "--source", str(source), "--blocks", str(blocks_path),
@@ -87,6 +100,7 @@ class PdfLayoutIntegrationTests(unittest.TestCase):
             right_text = output[0].get_text(clip=fitz.Rect(600, 0, 1200, 800))
             output.close()
             self.assertIn("E=mc", right_text)
+            self.assertNotIn("DUPLICATE", right_text)
 
     def test_cross_page_paragraph_sets_continuation_metadata(self):
         with tempfile.TemporaryDirectory() as td_raw:

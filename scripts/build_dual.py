@@ -495,8 +495,8 @@ def main(argv=None) -> int:
         inserts = []
         for b in blks:
             t = trans.get(b["id"])
-            if b.get("nested_in") and not (t or {}).get("zh"):
-                # bbox 嵌套簇的碎片：外层块已扩 bbox 覆盖此处，不重复处理
+            if b.get("nested_in"):
+                # bbox 嵌套簇的碎片已被外层块吸收；旧译文也绝不重复渲染
                 stats["skipped"] += 1
                 continue
             if not t:

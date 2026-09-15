@@ -410,9 +410,20 @@ line two`` 仍保留词间空格。
 
 
 def finalize_translation(block_id: str, text: str, item_meta: dict | None) -> str | None:
-    """Validate inline markers and restore immutable math before accepting output."""
+    """Enforce an exact ordered marker round trip before accepting output."""
     rendered = str(text or "")
     specs = (item_meta or {}).get(block_id, {}).get("inline_fragments", [])
+    positions = []
+    for spec in specs:
+        if rendered.count(spec["open"]) != 1 or rendered.count(spec["close"]) != 1:
+            return None
+        open_at = rendered.find(spec["open"])
+        close_at = rendered.find(spec["close"])
+        if close_at < open_at + len(spec["open"]):
+            return None
+        positions.append(open_at)
+    if positions != sorted(positions):
+        return None
     for spec in specs:
         pattern = re.compile(re.escape(spec["open"]) + r"(.*?)" + re.escape(spec["close"]), re.S)
         match = pattern.search(rendered)
@@ -426,6 +437,8 @@ def finalize_translation(block_id: str, text: str, item_meta: dict | None) -> st
         else:
             return None
         rendered = rendered[:match.start()] + replacement + rendered[match.end():]
+    if "[[PDT_INLINE_" in rendered or "[[/PDT_INLINE_" in rendered:
+        return None
     return normalize_translation_text(rendered) or None
 
 
@@ -736,6 +749,11 @@ def main(argv=None) -> int:
         block["id"]: PROV.block_identity(int(page.get("page", 0)), block)
         for page in pages for block in page.get("blocks", [])
     }
+    nested_targets = {
+        block["id"]: block["nested_in"]
+        for page in pages for block in page.get("blocks", [])
+        if block.get("nested_in")
+    }
     total_pages = data.get("page_count") or (max((p.get("page", 0) for p in pages), default=0))
     want = parse_pages(args.pages, total_pages)
     skip_pages = set(parse_pages(args.skip_pages, total_pages)) if args.skip_pages else set()
@@ -753,6 +771,13 @@ def main(argv=None) -> int:
         except Exception:
             existing = {}
     existing, resume_stats = filter_resume_entries(existing, block_identities)
+    for block_id, outer_id in nested_targets.items():
+        if block_id in existing:
+            existing[block_id] = {
+                "skip": True,
+                "absorbed_into": outer_id,
+                **block_identities.get(block_id, {}),
+            }
     n0 = sum(1 for v in existing.values() if (v.get("zh") or "").strip())
     if n0:
         print(f"续跑: 可验证并复用已有译文 {n0} 条")
@@ -796,7 +821,9 @@ def main(argv=None) -> int:
             if (b.get("flow_break") or b.get("kind") in {
                     "heading", "table", "table_caption", "figure_caption", "math_only"}):
                 flow_breaks.add(b["id"])
-            if args.no_skip:
+            if b.get("nested_in"):
+                sk, why = True, "簇内碎片"
+            elif args.no_skip:
                 sk, why = False, ""
             else:
                 sk, why = should_skip(b, pno, rect, ctx)
@@ -860,6 +887,9 @@ def main(argv=None) -> int:
 
     glossary = load_glossary(args.glossary)
     result = dict(existing)
+    for block_id, outer_id in nested_targets.items():
+        result[block_id] = {"skip": True, "absorbed_into": outer_id}
+        result[block_id].update(block_identities.get(block_id, {}))
     for i in skipped:
         if i not in result:
             result[i] = {"skip": True}

@@ -74,6 +74,38 @@ def block_text(block: dict) -> str:
     return clean_text("\n".join(lines))
 
 
+def source_line_records(block: dict) -> list[dict]:
+    """Keep compact physical-line/span geometry for later inline anchoring."""
+    records = []
+    for line in block.get("lines", []):
+        spans = []
+        for span in line.get("spans", []):
+            text = span.get("text", "")
+            bbox = span.get("bbox")
+            if not text or not bbox or len(bbox) != 4:
+                continue
+            spans.append({
+                "text": text,
+                "bbox": [round(float(value), 2) for value in bbox],
+            })
+        if not spans:
+            continue
+        bbox = line.get("bbox")
+        if not bbox or len(bbox) != 4:
+            bbox = [
+                min(span["bbox"][0] for span in spans),
+                min(span["bbox"][1] for span in spans),
+                max(span["bbox"][2] for span in spans),
+                max(span["bbox"][3] for span in spans),
+            ]
+        records.append({
+            "text": "".join(span["text"] for span in spans).rstrip(),
+            "bbox": [round(float(value), 2) for value in bbox],
+            "spans": spans,
+        })
+    return records
+
+
 def source_hash(page: int, bbox: list[float], text: str) -> str:
     # 与 v2/v3 provenance 契约保持一致：hash 绑定页码 + 规范化源文本。
     # bbox/flow 变化不会无谓使译文失效，但文本变化一定会触发重新翻译。
@@ -421,6 +453,7 @@ def merge_pair(a: dict, b: dict) -> dict:
     out["bbox"] = [round(float(v), 2) for v in bbox]
     out["text"] = clean_text(text)
     out["chars"] = len(out["text"])
+    out["source_lines"] = list(a.get("source_lines", [])) + list(b.get("source_lines", []))
     out["merged_from"] = list(a.get("merged_from", [a["id"]])) + list(b.get("merged_from", [b["id"]]))
     out["source_hash"] = source_hash(out["_page"], out["bbox"], out["text"])
     return out
@@ -598,6 +631,7 @@ def main(argv=None) -> int:
                     "has_math": bool(has_math),
                     "chars": len(text),
                     "text": text,
+                    "source_lines": source_line_records(rb),
                     "kind": kind,
                     "column": column,
                 }

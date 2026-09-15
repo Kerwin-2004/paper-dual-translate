@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -44,6 +45,78 @@ def inter_area(a, c) -> float:
 
 def area(a) -> float:
     return max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+
+
+def _nearest_text_boundary(text: str, offset: int) -> int:
+    offset = max(0, min(len(text), int(offset)))
+    boundaries = {0, len(text)}
+    for index, char in enumerate(text):
+        if char.isspace() or char in ",.;:!?()[]{}，。；：！？（）【】":
+            boundaries.update((index, index + 1))
+    return min(boundaries, key=lambda value: (abs(value - offset), value))
+
+
+def fragment_anchor_offset(outer: dict, fragment: dict) -> int:
+    """Estimate the fragment's semantic character position from PDF geometry."""
+    text = str(outer.get("text", ""))
+    if not text:
+        return 0
+    fb = fragment.get("bbox") or (0, 0, 0, 0)
+    fx = (float(fb[0]) + float(fb[2])) / 2
+    fy = (float(fb[1]) + float(fb[3])) / 2
+    lines = [line for line in outer.get("source_lines", [])
+             if line.get("bbox") and len(line["bbox"]) == 4]
+    if lines:
+        lines.sort(key=lambda line: (float(line["bbox"][1]), float(line["bbox"][0])))
+
+        def line_distance(line):
+            x0, y0, x1, y1 = [float(value) for value in line["bbox"]]
+            dy = 0.0 if y0 <= fy <= y1 else min(abs(fy - y0), abs(fy - y1))
+            dx = 0.0 if x0 <= fx <= x1 else min(abs(fx - x0), abs(fx - x1))
+            return dy, dx
+
+        target = min(lines, key=line_distance)
+        line_texts = [re.sub(r"\s+", " ", str(line.get("text", ""))).strip()
+                      for line in lines]
+        target_index = lines.index(target)
+        nominal_total = max(1, sum(len(value) + 1 for value in line_texts) - 1)
+        line_text = line_texts[target_index]
+        search_cursor = 0
+        line_starts = []
+        for index, value in enumerate(line_texts):
+            found = text.find(value, search_cursor) if value else -1
+            if found >= 0:
+                line_starts.append(found)
+                search_cursor = found + len(value)
+            else:
+                before = sum(len(item) + 1 for item in line_texts[:index])
+                line_starts.append(round(before / nominal_total * len(text)))
+        line_start = line_starts[target_index]
+
+        spans = sorted(
+            (span for span in target.get("spans", [])
+             if span.get("bbox") and len(span["bbox"]) == 4),
+            key=lambda span: float(span["bbox"][0]),
+        )
+        local = 0
+        for span in spans:
+            span_text = str(span.get("text", ""))
+            x0, x1 = float(span["bbox"][0]), float(span["bbox"][2])
+            if fx <= x0:
+                break
+            if x0 < fx < x1 and x1 > x0:
+                local += round(len(span_text) * (fx - x0) / (x1 - x0))
+                break
+            local += len(span_text)
+        return _nearest_text_boundary(text, line_start + min(local, len(line_text)))
+
+    x0, y0, x1, y1 = [float(value) for value in outer.get("bbox", (0, 0, 1, 1))]
+    line_height = max(1.0, float(outer.get("size", 9.0) or 9.0) * 1.25)
+    line_count = max(1, round(max(line_height, y1 - y0) / line_height))
+    row = max(0, min(line_count - 1, int((fy - y0) / line_height)))
+    x_ratio = max(0.0, min(1.0, (fx - x0) / max(1.0, x1 - x0)))
+    estimate = round(((row + x_ratio) / line_count) * len(text))
+    return _nearest_text_boundary(text, estimate)
 
 
 def find_clusters(pages: list[dict], min_ratio: float) -> dict[str, dict]:
@@ -90,7 +163,8 @@ def find_clusters(pages: list[dict], min_ratio: float) -> dict[str, dict]:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser("audit_nested_blocks", description="bbox 嵌套簇审计/修补")
     ap.add_argument("--blocks", required=True)
-    ap.add_argument("--apply", action="store_true", help="修补 blocks.json（扩外层 bbox、标 nested_in）")
+    ap.add_argument("--apply", action="store_true",
+                    help="修补 blocks.json（扩 bbox、标 nested_in、计算行内锚点）")
     ap.add_argument("--skeleton", default=None, help="生成翻译骨架 JSON 路径")
     ap.add_argument("--translations", default=None, help="translations.json（骨架只补缺）")
     ap.add_argument("--min-ratio", type=float, default=0.3,
@@ -154,6 +228,7 @@ def main(argv=None) -> int:
                 "kind": fr.get("kind"),
                 "math_only": bool(fr.get("math_only")),
                 "has_math": bool(fr.get("has_math")),
+                "anchor_offset": fragment_anchor_offset(cl["outer"], fr),
             } for fr in sorted(
                 cl["frags"], key=lambda item: (
                     float(item["bbox"][1]), float(item["bbox"][0]), item["id"]))]
